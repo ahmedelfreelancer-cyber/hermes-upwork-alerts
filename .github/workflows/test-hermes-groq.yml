@@ -32,13 +32,26 @@ jobs:
           hermes --version
           hermes doctor || true
 
+      - name: Configure Hermes for Groq (named custom provider)
+        run: |
+          mkdir -p "$HOME/.hermes"
+          printf '%s\n' \
+            'providers:' \
+            '  groq:' \
+            '    api: https://api.groq.com/openai/v1' \
+            '    key_env: GROQ_API_KEY' \
+            '' \
+            'model:' \
+            '  default: openai/gpt-oss-120b' \
+            '  provider: custom:groq' \
+            > "$HOME/.hermes/config.yaml"
+          echo "---- config.yaml ----"
+          cat "$HOME/.hermes/config.yaml"
+
       - name: Run Hermes one-shot smoke test (Groq)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          HERMES_INFERENCE_PROVIDER: custom
-          CUSTOM_BASE_URL: https://api.groq.com/openai/v1
-          HERMES_INFERENCE_MODEL: openai/gpt-oss-120b
         run: |
-          OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK" --ignore-user-config)
+          OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK")
           echo "Hermes replied: $OUTPUT"
           echo "$OUTPUT" | grep -q "HERMES OK" && echo "Hermes responded correctly" || (echo "Unexpected output from Hermes" && exit 1)
