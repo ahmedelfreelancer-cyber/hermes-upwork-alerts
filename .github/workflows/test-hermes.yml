@@ -37,6 +37,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           HERMES_INFERENCE_MODEL: openrouter/nvidia/nemotron-3.5-lightning:free
         run: |
-          OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK" --ignore-user-config -Q)
+          OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK" --ignore-user-config)
           echo "Hermes replied: $OUTPUT"
           echo "$OUTPUT" | grep -q "HERMES OK" && echo "Hermes responded correctly" || (echo "Unexpected output from Hermes" && exit 1)
