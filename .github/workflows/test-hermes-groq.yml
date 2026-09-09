@@ -32,7 +32,7 @@ jobs:
           hermes --version
           hermes doctor || true
 
-      - name: Configure Hermes for Groq (named custom provider)
+      - name: Configure Hermes for Groq (named custom provider, no default toolsets)
         run: |
           mkdir -p "$HOME/.hermes"
           printf '%s\n' \
@@ -44,6 +44,9 @@ jobs:
             'model:' \
             '  default: openai/gpt-oss-120b' \
             '  provider: custom:groq' \
+            '' \
+            'platform_toolsets:' \
+            '  cli: []' \
             > "$HOME/.hermes/config.yaml"
           echo "---- config.yaml ----"
           cat "$HOME/.hermes/config.yaml"
@@ -51,6 +54,7 @@ jobs:
       - name: Run Hermes one-shot smoke test (Groq)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          HERMES_IGNORE_RULES: "1"
         run: |
           OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK")
           echo "Hermes replied: $OUTPUT"
