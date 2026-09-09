@@ -35,7 +35,8 @@ jobs:
       - name: Run Hermes one-shot smoke test
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          HERMES_INFERENCE_MODEL: openrouter/nvidia/nemotron-3.5-lightning:free
+          HERMES_INFERENCE_PROVIDER: openrouter
+          HERMES_INFERENCE_MODEL: nvidia/nemotron-3.5-lightning:free
         run: |
           OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK" --ignore-user-config)
           echo "Hermes replied: $OUTPUT"
