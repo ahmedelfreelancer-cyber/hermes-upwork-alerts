@@ -93,6 +93,11 @@ jobs:
               desc = (t.get("description") or "")[:150]
               print(f"TOOL: {name} | readOnlyHint={read_only} | {desc}")
 
+          print("---- FULL DETAIL: upwork__find_jobs ----")
+          for t in tools:
+              if t.get("name") == "upwork__find_jobs":
+                  print(json.dumps(t, indent=2))
+
           with open("upwork_tools_catalog.json", "w") as f:
               json.dump(tools, f, indent=2)
           PYEOF
