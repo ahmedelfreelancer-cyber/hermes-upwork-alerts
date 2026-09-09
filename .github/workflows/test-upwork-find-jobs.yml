@@ -76,12 +76,47 @@ jobs:
           except Exception as exc:  # noqa: BLE001
               print("initialized notification note:", exc)
 
-          # 2. THE ONE TEST SEARCH — tool name and arguments are printed verbatim below,
+          # 2. Upwork's MCP requires an account context before find_jobs will run
+          #    (a freelancer account can have multiple orgs/sub-accounts). This is a
+          #    required, read-only precursor call — not an extra action beyond the search.
+          status_la, sid_la, raw_la = post({
+              "jsonrpc": "2.0",
+              "id": 2,
+              "method": "tools/call",
+              "params": {"name": "upwork__list_accounts", "arguments": {"action": "list"}},
+          }, session_id=sid)
+          list_accounts_result = parse_body(raw_la)
+          print("LIST_ACCOUNTS_HTTP_STATUS:", status_la)
+          print("LIST_ACCOUNTS_RAW:", json.dumps(list_accounts_result, indent=2))
+
+          org_uid = None
+          try:
+              blocks = list_accounts_result.get("result", {}).get("content", [])
+              for b in blocks:
+                  if b.get("type") == "text":
+                      parsed = json.loads(b["text"])
+                      accounts = parsed.get("accounts") or parsed.get("data") or parsed
+                      if isinstance(accounts, list) and accounts:
+                          # Prefer a freelancer-type account if the shape tells us; otherwise take the first.
+                          chosen = accounts[0]
+                          for acc in accounts:
+                              if isinstance(acc, dict) and str(acc.get("type", "")).lower() == "freelancer":
+                                  chosen = acc
+                                  break
+                          org_uid = chosen.get("org_uid") or chosen.get("orgUid") or chosen.get("id")
+          except Exception as exc:  # noqa: BLE001
+              print("org_uid extraction note:", exc)
+
+          print("ORG_UID_RESOLVED:", org_uid)
+
+          # 3. THE ONE TEST SEARCH — tool name and arguments are printed verbatim below,
           #    exactly as sent, before the call is made. Nothing here was chosen by the model:
-          #    every field maps directly to criteria the user supplied in chat.
+          #    every field maps directly to criteria the user supplied in chat, plus the
+          #    org_uid account context required by Upwork's MCP (see above).
           TOOL_NAME = "upwork__find_jobs"
           TOOL_ARGUMENTS = {
               "action": "search",
+              "org_uid": org_uid,
               "params": {
                   "query": "WordPress Elementor website redesign landing page WooCommerce",
                   "budget_min": 250,
@@ -97,7 +132,7 @@ jobs:
 
           status3, sid3, raw3 = post({
               "jsonrpc": "2.0",
-              "id": 2,
+              "id": 3,
               "method": "tools/call",
               "params": {"name": TOOL_NAME, "arguments": TOOL_ARGUMENTS},
           }, session_id=sid)
