@@ -1,0 +1,105 @@
+name: Upwork MCP Discovery (read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  discover-upwork-mcp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Discover Upwork MCP tool catalog (raw JSON-RPC over HTTPS, read-only)
+        env:
+          UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["UPWORK_ACCESS_TOKEN"]
+          url = "https://mcp.upwork.com/mcp"
+          base_headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json, text/event-stream",
+              "Content-Type": "application/json",
+              "MCP-Protocol-Version": "2025-06-18",
+              "User-Agent": "python-httpx/0.27",
+          }
+
+          def post(body, session_id=None, expect_response=True):
+              headers = dict(base_headers)
+              if session_id:
+                  headers["Mcp-Session-Id"] = session_id
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=headers, method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  sid = resp.headers.get("Mcp-Session-Id")
+                  raw = resp.read().decode() if expect_response else ""
+                  return resp.status, sid, raw
+
+          def parse_body(raw):
+              raw = raw.strip()
+              if not raw:
+                  return {}
+              if raw.startswith("event:") or raw.startswith("data:"):
+                  for line in raw.splitlines():
+                      if line.startswith("data:"):
+                          return json.loads(line[len("data:"):].strip())
+              return json.loads(raw)
+
+          # 1. initialize
+          status, sid, raw = post({
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "initialize",
+              "params": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {},
+                  "clientInfo": {"name": "hermes-upwork-discovery", "version": "1.0"},
+              },
+          })
+          init_result = parse_body(raw)
+          print("INIT_HTTP_STATUS:", status)
+          print("SESSION_ID_PRESENT:", bool(sid))
+          print("SERVER_INFO:", json.dumps(init_result.get("result", {}).get("serverInfo", {})))
+          print("PROTOCOL_VERSION:", init_result.get("result", {}).get("protocolVersion"))
+
+          # 2. notifications/initialized (fire and forget)
+          try:
+              post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid, expect_response=False)
+          except Exception as exc:  # noqa: BLE001
+              print("initialized notification note:", exc)
+
+          # 3. tools/list
+          status2, sid2, raw2 = post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session_id=sid)
+          tools_result = parse_body(raw2)
+          tools = tools_result.get("result", {}).get("tools", [])
+          print("TOOLS_HTTP_STATUS:", status2)
+          print("TOOLS_COUNT:", len(tools))
+          print("---- TOOL CATALOG ----")
+          for t in tools:
+              name = t.get("name")
+              read_only = t.get("annotations", {}).get("readOnlyHint")
+              desc = (t.get("description") or "")[:150]
+              print(f"TOOL: {name} | readOnlyHint={read_only} | {desc}")
+
+          with open("upwork_tools_catalog.json", "w") as f:
+              json.dump(tools, f, indent=2)
+          PYEOF
+
+      - name: Upload full tool catalog as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upwork-mcp-tool-catalog
+          path: upwork_tools_catalog.json
+          retention-days: 7
