@@ -1,0 +1,137 @@
+name: Upwork Find Jobs (single test search, read-only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-find-jobs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run ONE upwork__find_jobs search with explicit, pre-set criteria (read-only)
+        env:
+          UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
+        run: |
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["UPWORK_ACCESS_TOKEN"]
+          url = "https://mcp.upwork.com/mcp"
+          base_headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json, text/event-stream",
+              "Content-Type": "application/json",
+              "MCP-Protocol-Version": "2025-06-18",
+              "User-Agent": "python-httpx/0.27",
+          }
+
+          def post(body, session_id=None, expect_response=True):
+              headers = dict(base_headers)
+              if session_id:
+                  headers["Mcp-Session-Id"] = session_id
+              req = urllib.request.Request(
+                  url, data=json.dumps(body).encode(), headers=headers, method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  sid = resp.headers.get("Mcp-Session-Id")
+                  raw = resp.read().decode() if expect_response else ""
+                  return resp.status, sid, raw
+
+          def parse_body(raw):
+              raw = raw.strip()
+              if not raw:
+                  return {}
+              if raw.startswith("event:") or raw.startswith("data:"):
+                  for line in raw.splitlines():
+                      if line.startswith("data:"):
+                          return json.loads(line[len("data:"):].strip())
+              return json.loads(raw)
+
+          # 1. initialize
+          status, sid, raw = post({
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "initialize",
+              "params": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {},
+                  "clientInfo": {"name": "hermes-upwork-test-search", "version": "1.0"},
+              },
+          })
+          init_result = parse_body(raw)
+          print("INIT_HTTP_STATUS:", status)
+
+          try:
+              post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid, expect_response=False)
+          except Exception as exc:  # noqa: BLE001
+              print("initialized notification note:", exc)
+
+          # 2. THE ONE TEST SEARCH — tool name and arguments are printed verbatim below,
+          #    exactly as sent, before the call is made. Nothing here was chosen by the model:
+          #    every field maps directly to criteria the user supplied in chat.
+          TOOL_NAME = "upwork__find_jobs"
+          TOOL_ARGUMENTS = {
+              "action": "search",
+              "params": {
+                  "query": "WordPress Elementor website redesign landing page WooCommerce",
+                  "budget_min": 250,
+                  "rate_min": 12,
+                  "verified_payment_only": True,
+                  "sort": "recency",
+                  "limit": 10,
+              },
+          }
+
+          print("TOOL_USED:", TOOL_NAME)
+          print("PARAMS_SENT:", json.dumps(TOOL_ARGUMENTS, indent=2))
+
+          status3, sid3, raw3 = post({
+              "jsonrpc": "2.0",
+              "id": 2,
+              "method": "tools/call",
+              "params": {"name": TOOL_NAME, "arguments": TOOL_ARGUMENTS},
+          }, session_id=sid)
+          call_result = parse_body(raw3)
+          print("CALL_HTTP_STATUS:", status3)
+
+          if "error" in call_result:
+              print("MCP_ERROR:", json.dumps(call_result["error"], indent=2))
+          else:
+              result = call_result.get("result", {})
+              content_blocks = result.get("content", [])
+              # MCP tool results carry their payload as content blocks (usually one text block
+              # containing JSON). Parse and print it directly.
+              for block in content_blocks:
+                  if block.get("type") == "text":
+                      text = block["text"]
+                      try:
+                          parsed = json.loads(text)
+                          print("RESULT_JSON:")
+                          print(json.dumps(parsed, indent=2))
+                      except json.JSONDecodeError:
+                          print("RESULT_TEXT:")
+                          print(text)
+                  else:
+                      print("RESULT_BLOCK (non-text):", json.dumps(block, indent=2))
+
+              with open("find_jobs_result.json", "w") as f:
+                  json.dump(call_result, f, indent=2)
+          PYEOF
+
+      - name: Upload raw search result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upwork-find-jobs-result
+          path: find_jobs_result.json
+          retention-days: 7
+          if-no-files-found: ignore
