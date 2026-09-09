@@ -1,0 +1,42 @@
+name: Hermes Test Run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-hermes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+
+      - name: Install Hermes Agent (official installer)
+        run: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+
+      - name: Add Hermes to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show Hermes version and diagnostics
+        run: |
+          hermes --version
+          hermes doctor || true
+
+      - name: Run Hermes one-shot smoke test
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          HERMES_INFERENCE_MODEL: openrouter/nvidia/nemotron-3.5-lightning:free
+        run: |
+          OUTPUT=$(hermes -z "Reply with exactly and only these two words: HERMES OK" --ignore-user-config -Q)
+          echo "Hermes replied: $OUTPUT"
+          echo "$OUTPUT" | grep -q "HERMES OK" && echo "Hermes responded correctly" || (echo "Unexpected output from Hermes" && exit 1)
