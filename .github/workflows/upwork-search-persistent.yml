@@ -1,0 +1,357 @@
+name: Upwork Search (persistent auth, deterministic filter, read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Force a token refresh this run, even if the current access token still works (used to test persistence end-to-end)"
+        type: boolean
+        default: false
+
+jobs:
+  upwork-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
+        run: pip install --quiet pynacl
+
+      - name: Refresh Upwork OAuth if needed, persist to GitHub Secrets, run ONE read-only search, apply deterministic post-filter
+        env:
+          UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
+          UPWORK_REFRESH_TOKEN: ${{ secrets.UPWORK_REFRESH_TOKEN }}
+          GH_SECRETS_ADMIN_PAT: ${{ secrets.GH_SECRETS_ADMIN_PAT }}
+          FORCE_REFRESH: ${{ inputs.force_refresh }}
+          GH_REPO_SLUG: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import base64
+          import datetime
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          from nacl import encoding, public
+
+          REPO = os.environ["GH_REPO_SLUG"]
+          GH_API = f"https://api.github.com/repos/{REPO}/actions/secrets"
+          UPWORK_TOKEN_URL = "https://www.upwork.com/api/v3/oauth2/token"
+          MCP_URL = "https://mcp.upwork.com/mcp"
+
+          access_token = os.environ["UPWORK_ACCESS_TOKEN"]
+          refresh_token = os.environ["UPWORK_REFRESH_TOKEN"]
+          admin_pat = os.environ["GH_SECRETS_ADMIN_PAT"]
+          force_refresh = os.environ.get("FORCE_REFRESH", "false").lower() == "true"
+
+          def mcp_headers(token, session_id=None):
+              h = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/json, text/event-stream",
+                  "Content-Type": "application/json",
+                  "MCP-Protocol-Version": "2025-06-18",
+                  "User-Agent": "python-httpx/0.27",
+              }
+              if session_id:
+                  h["Mcp-Session-Id"] = session_id
+              return h
+
+          def mcp_post(token, body, session_id=None):
+              req = urllib.request.Request(
+                  MCP_URL, data=json.dumps(body).encode(), headers=mcp_headers(token, session_id), method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  sid = resp.headers.get("Mcp-Session-Id")
+                  raw = resp.read().decode()
+                  return resp.status, sid, raw
+
+          def parse_body(raw):
+              raw = raw.strip()
+              if not raw:
+                  return {}
+              if raw.startswith("event:") or raw.startswith("data:"):
+                  for line in raw.splitlines():
+                      if line.startswith("data:"):
+                          return json.loads(line[len("data:"):].strip())
+              return json.loads(raw)
+
+          def probe_token(token):
+              body = {
+                  "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {
+                      "protocolVersion": "2025-06-18",
+                      "capabilities": {},
+                      "clientInfo": {"name": "hermes-upwork-persistent", "version": "1.0"},
+                  },
+              }
+              try:
+                  mcp_post(token, body)
+                  return True
+              except urllib.error.HTTPError as e:
+                  if e.code in (401, 403):
+                      return False
+                  raise
+
+          def refresh_upwork_token(refresh_tok):
+              data = urllib.parse.urlencode({
+                  "grant_type": "refresh_token",
+                  "refresh_token": refresh_tok,
+              }).encode()
+              req = urllib.request.Request(
+                  UPWORK_TOKEN_URL, data=data,
+                  headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "python-httpx/0.27"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode())
+
+          def get_repo_public_key():
+              req = urllib.request.Request(
+                  f"{GH_API}/public-key",
+                  headers={
+                      "Authorization": f"Bearer {admin_pat}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode())
+
+          def encrypt_secret(public_key_b64, secret_value):
+              pk = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+              box = public.SealedBox(pk)
+              encrypted = box.encrypt(secret_value.encode("utf-8"))
+              return base64.b64encode(encrypted).decode("utf-8")
+
+          def put_secret(name, value, key_id, public_key_b64):
+              enc = encrypt_secret(public_key_b64, value)
+              payload = json.dumps({"encrypted_value": enc, "key_id": key_id}).encode()
+              req = urllib.request.Request(
+                  f"{GH_API}/{name}", data=payload,
+                  headers={
+                      "Authorization": f"Bearer {admin_pat}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+                  method="PUT",
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return resp.status
+
+          refreshed = False
+          current_access_token = access_token
+
+          if force_refresh:
+              print("FORCE_REFRESH input set — refreshing this run to prove the persistence cycle end-to-end.")
+              probe_ok = False
+          else:
+              probe_ok = probe_token(access_token)
+              print("ACCESS_TOKEN_PROBE_OK:", probe_ok)
+
+          if not probe_ok:
+              print("Refreshing Upwork OAuth token via refresh_token grant...")
+              token_response = refresh_upwork_token(refresh_token)
+
+              new_access = token_response["access_token"]
+              new_refresh = token_response.get("refresh_token", refresh_token)
+
+              print(f"::add-mask::{new_access}")
+              print(f"::add-mask::{new_refresh}")
+
+              print("REFRESH_SUCCEEDED: True")
+              print("NEW_TOKEN_EXPIRES_IN_SECONDS:", token_response.get("expires_in"))
+
+              key_info = get_repo_public_key()
+              s1 = put_secret("UPWORK_ACCESS_TOKEN", new_access, key_info["key_id"], key_info["key"])
+              s2 = put_secret("UPWORK_REFRESH_TOKEN", new_refresh, key_info["key_id"], key_info["key"])
+              print("SECRET_UPDATE_HTTP_STATUS_ACCESS_TOKEN:", s1)
+              print("SECRET_UPDATE_HTTP_STATUS_REFRESH_TOKEN:", s2)
+
+              current_access_token = new_access
+              refreshed = True
+          else:
+              print("Existing access token still valid — no refresh needed, no secrets touched this run.")
+
+          print("PERSISTENCE_RESULT:", "REFRESHED_AND_PERSISTED" if refreshed else "REUSED_EXISTING_VALID_TOKEN")
+
+          status, sid, raw = mcp_post(current_access_token, {
+              "jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {},
+                  "clientInfo": {"name": "hermes-upwork-persistent", "version": "1.0"},
+              },
+          })
+          try:
+              mcp_post(current_access_token, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
+          except Exception as exc:  # noqa: BLE001
+              print("initialized notification note:", exc)
+
+          _, _, raw_la = mcp_post(current_access_token, {
+              "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "upwork__list_accounts", "arguments": {"action": "list"}},
+          }, session_id=sid)
+          list_accounts_result = parse_body(raw_la)
+
+          org_uid = None
+          try:
+              blocks = list_accounts_result.get("result", {}).get("content", [])
+              for b in blocks:
+                  if b.get("type") == "text":
+                      parsed_accounts = json.loads(b["text"])
+                      accounts = parsed_accounts.get("accounts") or parsed_accounts.get("data") or parsed_accounts
+                      if isinstance(accounts, list) and accounts:
+                          chosen = accounts[0]
+                          for acc in accounts:
+                              if isinstance(acc, dict) and str(acc.get("type", "")).lower() == "freelancer":
+                                  chosen = acc
+                                  break
+                          org_uid = chosen.get("org_uid") or chosen.get("orgUid") or chosen.get("id")
+          except Exception as exc:  # noqa: BLE001
+              print("org_uid extraction note:", exc)
+
+          print("ORG_UID_RESOLVED:", org_uid)
+
+          TOOL_NAME = "upwork__find_jobs"
+          TOOL_ARGUMENTS = {
+              "action": "search",
+              "org_uid": org_uid,
+              "params": {
+                  "query": "WordPress Elementor website redesign landing page WooCommerce",
+                  "budget_min": 250,
+                  "rate_min": 12,
+                  "verified_payment_only": True,
+                  "sort": "recency",
+                  "limit": 10,
+              },
+          }
+          print("TOOL_USED:", TOOL_NAME)
+          print("PARAMS_SENT:", json.dumps(TOOL_ARGUMENTS, indent=2))
+
+          _, _, raw3 = mcp_post(current_access_token, {
+              "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+              "params": {"name": TOOL_NAME, "arguments": TOOL_ARGUMENTS},
+          }, session_id=sid)
+          call_result = parse_body(raw3)
+
+          if "error" in call_result:
+              print("MCP_ERROR:", json.dumps(call_result["error"], indent=2))
+              raise SystemExit(0)
+
+          result = call_result.get("result", {})
+          content_blocks = result.get("content", [])
+          parsed = {}
+          for block in content_blocks:
+              if block.get("type") == "text":
+                  try:
+                      parsed = json.loads(block["text"])
+                  except json.JSONDecodeError:
+                      print("RESULT_TEXT (not JSON):", block["text"])
+
+          raw_jobs = parsed.get("jobs", [])
+          print("RAW_JOB_COUNT:", len(raw_jobs))
+
+          EXCLUDE_KEYWORDS = [
+              "react", "next.js", "nextjs", "laravel",
+              "plugin development", "custom php backend",
+              "full-stack", "full stack", "fullstack",
+          ]
+
+          def parse_budget_fixed(budget_str):
+              try:
+                  return float(str(budget_str).replace(",", ""))
+              except (ValueError, TypeError):
+                  return None
+
+          def parse_hourly_min(budget_str):
+              try:
+                  s = str(budget_str).replace("/hr", "").strip()
+                  for dash in ("–", "-"):
+                      if dash in s:
+                          return float(s.split(dash)[0].replace(",", ""))
+                  return float(s.replace(",", ""))
+              except (ValueError, TypeError):
+                  return None
+
+          def contains_excluded_keyword(job):
+              text = " ".join([
+                  job.get("title", "") or "",
+                  " ".join(job.get("skills") or []),
+                  (job.get("description_snippet", "") or "")
+                      .replace("<untrusted_participant_content>", "")
+                      .replace("</untrusted_participant_content>", ""),
+              ]).lower()
+              for kw in EXCLUDE_KEYWORDS:
+                  if kw in text:
+                      return kw
+              return None
+
+          def posted_within_24h(job):
+              ts = job.get("published_date") or job.get("created_date")
+              if not ts:
+                  return True
+              try:
+                  posted = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                  now = datetime.datetime.now(datetime.timezone.utc)
+                  return (now - posted) <= datetime.timedelta(hours=24)
+              except ValueError:
+                  return True
+
+          def passes_filters(job):
+              reasons = []
+              job_type = job.get("job_type")
+              budget = job.get("budget")
+              if job_type == "hourly":
+                  min_rate = parse_hourly_min(budget)
+                  if min_rate is None or min_rate < 12:
+                      reasons.append(f"hourly_min_below_12(${min_rate})")
+              elif job_type == "fixed":
+                  fixed_amt = parse_budget_fixed(budget)
+                  if fixed_amt is None or fixed_amt < 250:
+                      reasons.append(f"fixed_below_250(${fixed_amt})")
+              kw = contains_excluded_keyword(job)
+              if kw:
+                  reasons.append(f"excluded_keyword({kw})")
+              if not posted_within_24h(job):
+                  reasons.append("older_than_24h")
+              return (len(reasons) == 0), reasons
+
+          kept, dropped = [], []
+          for job in raw_jobs:
+              ok, reasons = passes_filters(job)
+              (kept if ok else dropped).append(job if ok else {"id": job.get("id"), "title": job.get("title"), "reasons": reasons})
+
+          print("KEPT_AFTER_DETERMINISTIC_FILTER:", len(kept))
+          print("DROPPED_COUNT:", len(dropped))
+          print("DROPPED_JOBS:")
+          print(json.dumps(dropped, indent=2))
+          print("KEPT_JOBS:")
+          print(json.dumps(kept, indent=2))
+
+          with open("filtered_result.json", "w") as f:
+              json.dump({
+                  "persistence_result": "REFRESHED_AND_PERSISTED" if refreshed else "REUSED_EXISTING_VALID_TOKEN",
+                  "raw_job_count": len(raw_jobs),
+                  "kept_count": len(kept),
+                  "kept_jobs": kept,
+                  "dropped_jobs": dropped,
+              }, f, indent=2)
+          PYEOF
+
+      - name: Upload filtered result as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upwork-filtered-result
+          path: filtered_result.json
+          retention-days: 7
+          if-no-files-found: ignore
