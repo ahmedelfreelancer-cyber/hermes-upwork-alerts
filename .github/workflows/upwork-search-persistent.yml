@@ -1,4 +1,4 @@
-name: Upwork Search (persistent auth, deterministic filter, read-only)
+name: Upwork Search (persistent auth, deterministic filter, private Telegram delivery)
 
 on:
   workflow_dispatch:
@@ -24,11 +24,13 @@ jobs:
       - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
         run: pip install --quiet pynacl
 
-      - name: Refresh Upwork OAuth if needed, persist to GitHub Secrets, run ONE read-only search, apply deterministic post-filter
+      - name: Refresh Upwork OAuth if needed, run ONE read-only search, filter, deliver privately to Telegram (no job data in logs/artifacts)
         env:
           UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
           UPWORK_REFRESH_TOKEN: ${{ secrets.UPWORK_REFRESH_TOKEN }}
           GH_SECRETS_ADMIN_PAT: ${{ secrets.GH_SECRETS_ADMIN_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           GH_REPO_SLUG: ${{ github.repository }}
         run: |
@@ -47,11 +49,15 @@ jobs:
           GH_API = f"https://api.github.com/repos/{REPO}/actions/secrets"
           UPWORK_TOKEN_URL = "https://www.upwork.com/api/v3/oauth2/token"
           MCP_URL = "https://mcp.upwork.com/mcp"
+          TELEGRAM_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
 
           access_token = os.environ["UPWORK_ACCESS_TOKEN"]
           refresh_token = os.environ["UPWORK_REFRESH_TOKEN"]
           admin_pat = os.environ["GH_SECRETS_ADMIN_PAT"]
+          telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
           force_refresh = os.environ.get("FORCE_REFRESH", "false").lower() == "true"
+
+          # ---------- MCP helpers (read-only calls only) ----------
 
           def mcp_headers(token, session_id=None):
               h = {
@@ -101,6 +107,8 @@ jobs:
                       return False
                   raise
 
+          # ---------- Upwork token refresh ----------
+
           def refresh_upwork_token(refresh_tok):
               data = urllib.parse.urlencode({
                   "grant_type": "refresh_token",
@@ -113,6 +121,8 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=30) as resp:
                   return json.loads(resp.read().decode())
+
+          # ---------- GitHub Secrets (libsodium sealed box) ----------
 
           def get_repo_public_key():
               req = urllib.request.Request(
@@ -148,6 +158,35 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as resp:
                   return resp.status
 
+          # ---------- Telegram delivery (private, real job details go ONLY here) ----------
+
+          def send_telegram(text):
+              data = urllib.parse.urlencode({
+                  "chat_id": telegram_chat_id,
+                  "text": text,
+                  "disable_web_page_preview": "true",
+              }).encode()
+              req = urllib.request.Request(TELEGRAM_API, data=data, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.status == 200
+              except urllib.error.HTTPError:
+                  return False
+
+          def chunk_text(text, limit=3800):
+              chunks = []
+              while len(text) > limit:
+                  cut = text.rfind("\n\n", 0, limit)
+                  if cut == -1:
+                      cut = limit
+                  chunks.append(text[:cut])
+                  text = text[cut:]
+              if text:
+                  chunks.append(text)
+              return chunks
+
+          # ---------- Step 1: use existing token, refresh only if needed ----------
+
           refreshed = False
           current_access_token = access_token
 
@@ -165,6 +204,7 @@ jobs:
               new_access = token_response["access_token"]
               new_refresh = token_response.get("refresh_token", refresh_token)
 
+              # Mask secret values in the log stream before printing anything else.
               print(f"::add-mask::{new_access}")
               print(f"::add-mask::{new_refresh}")
 
@@ -184,6 +224,9 @@ jobs:
 
           print("PERSISTENCE_RESULT:", "REFRESHED_AND_PERSISTED" if refreshed else "REUSED_EXISTING_VALID_TOKEN")
 
+          # ---------- Step 2: the one read-only search (same fixed criteria as before) ----------
+          # Nothing from this point on that touches job/client content is printed. Only counts.
+
           status, sid, raw = mcp_post(current_access_token, {
               "jsonrpc": "2.0", "id": 1, "method": "initialize",
               "params": {
@@ -194,8 +237,8 @@ jobs:
           })
           try:
               mcp_post(current_access_token, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
-          except Exception as exc:  # noqa: BLE001
-              print("initialized notification note:", exc)
+          except Exception:
+              pass
 
           _, _, raw_la = mcp_post(current_access_token, {
               "jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -217,12 +260,9 @@ jobs:
                                   chosen = acc
                                   break
                           org_uid = chosen.get("org_uid") or chosen.get("orgUid") or chosen.get("id")
-          except Exception as exc:  # noqa: BLE001
-              print("org_uid extraction note:", exc)
+          except Exception:
+              pass  # deliberately not printed — this branch never handles job/account content in logs
 
-          print("ORG_UID_RESOLVED:", org_uid)
-
-          TOOL_NAME = "upwork__find_jobs"
           TOOL_ARGUMENTS = {
               "action": "search",
               "org_uid": org_uid,
@@ -235,17 +275,15 @@ jobs:
                   "limit": 10,
               },
           }
-          print("TOOL_USED:", TOOL_NAME)
-          print("PARAMS_SENT:", json.dumps(TOOL_ARGUMENTS, indent=2))
 
           _, _, raw3 = mcp_post(current_access_token, {
               "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-              "params": {"name": TOOL_NAME, "arguments": TOOL_ARGUMENTS},
+              "params": {"name": "upwork__find_jobs", "arguments": TOOL_ARGUMENTS},
           }, session_id=sid)
           call_result = parse_body(raw3)
 
           if "error" in call_result:
-              print("MCP_ERROR:", json.dumps(call_result["error"], indent=2))
+              print("MCP_ERROR_CODE:", call_result["error"].get("code"))
               raise SystemExit(0)
 
           result = call_result.get("result", {})
@@ -256,10 +294,11 @@ jobs:
                   try:
                       parsed = json.loads(block["text"])
                   except json.JSONDecodeError:
-                      print("RESULT_TEXT (not JSON):", block["text"])
+                      pass
 
           raw_jobs = parsed.get("jobs", [])
-          print("RAW_JOB_COUNT:", len(raw_jobs))
+
+          # ---------- Step 3: deterministic post-filter — Ahmed's explicit rules only, no scoring ----------
 
           EXCLUDE_KEYWORDS = [
               "react", "next.js", "nextjs", "laravel",
@@ -308,50 +347,46 @@ jobs:
                   return True
 
           def passes_filters(job):
-              reasons = []
               job_type = job.get("job_type")
               budget = job.get("budget")
               if job_type == "hourly":
                   min_rate = parse_hourly_min(budget)
                   if min_rate is None or min_rate < 12:
-                      reasons.append(f"hourly_min_below_12(${min_rate})")
+                      return False
               elif job_type == "fixed":
                   fixed_amt = parse_budget_fixed(budget)
                   if fixed_amt is None or fixed_amt < 250:
-                      reasons.append(f"fixed_below_250(${fixed_amt})")
-              kw = contains_excluded_keyword(job)
-              if kw:
-                  reasons.append(f"excluded_keyword({kw})")
+                      return False
+              if contains_excluded_keyword(job):
+                  return False
               if not posted_within_24h(job):
-                  reasons.append("older_than_24h")
-              return (len(reasons) == 0), reasons
+                  return False
+              return True
 
-          kept, dropped = [], []
-          for job in raw_jobs:
-              ok, reasons = passes_filters(job)
-              (kept if ok else dropped).append(job if ok else {"id": job.get("id"), "title": job.get("title"), "reasons": reasons})
+          kept = [job for job in raw_jobs if passes_filters(job)]
 
-          print("KEPT_AFTER_DETERMINISTIC_FILTER:", len(kept))
-          print("DROPPED_COUNT:", len(dropped))
-          print("DROPPED_JOBS:")
-          print(json.dumps(dropped, indent=2))
-          print("KEPT_JOBS:")
-          print(json.dumps(kept, indent=2))
+          print("JOBS_CHECKED:", len(raw_jobs))
+          print("JOBS_PASSED_FILTER:", len(kept))
 
-          with open("filtered_result.json", "w") as f:
-              json.dump({
-                  "persistence_result": "REFRESHED_AND_PERSISTED" if refreshed else "REUSED_EXISTING_VALID_TOKEN",
-                  "raw_job_count": len(raw_jobs),
-                  "kept_count": len(kept),
-                  "kept_jobs": kept,
-                  "dropped_jobs": dropped,
-              }, f, indent=2)
+          # ---------- Step 4: private delivery to Telegram only — never printed, never uploaded ----------
+
+          telegram_ok = True
+          if kept:
+              lines = [f"Upwork search: {len(kept)} job(s) passed your filters\n"]
+              for job in kept:
+                  lines.append(
+                      f"{job.get('title', '(no title)')}\n"
+                      f"Budget: {job.get('budget', 'n/a')} ({job.get('job_type', 'n/a')})\n"
+                      f"Client: {job.get('client', {}).get('country', 'n/a')}"
+                      + (f", {job.get('client', {}).get('rating')}★" if job.get('client', {}).get('rating') else "")
+                      + f"\n{job.get('url', '')}\n"
+                  )
+              message = "\n".join(lines)
+              for chunk in chunk_text(message):
+                  ok = send_telegram(chunk)
+                  telegram_ok = telegram_ok and ok
+          else:
+              telegram_ok = send_telegram("Upwork search: 0 jobs passed your filters this run.")
+
+          print("TELEGRAM_SEND:", "success" if telegram_ok else "failed")
           PYEOF
-
-      - name: Upload filtered result as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: upwork-filtered-result
-          path: filtered_result.json
-          retention-days: 7
-          if-no-files-found: ignore
