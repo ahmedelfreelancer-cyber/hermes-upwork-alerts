@@ -49,6 +49,8 @@ jobs:
           REPO = os.environ["GH_REPO_SLUG"]
           GH_API = f"https://api.github.com/repos/{REPO}/actions/secrets"
           UPWORK_TOKEN_URL = "https://www.upwork.com/api/v3/oauth2/token"
+          UPWORK_CLIENT_ID = "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json"
+          UPWORK_RESOURCE = "https://mcp.upwork.com/mcp"
           MCP_URL = "https://mcp.upwork.com/mcp"
           TELEGRAM_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
 
@@ -114,14 +116,21 @@ jobs:
               data = urllib.parse.urlencode({
                   "grant_type": "refresh_token",
                   "refresh_token": refresh_tok,
+                  "client_id": UPWORK_CLIENT_ID,
+                  "resource": UPWORK_RESOURCE,
               }).encode()
               req = urllib.request.Request(
                   UPWORK_TOKEN_URL, data=data,
                   headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "python-httpx/0.27"},
                   method="POST",
               )
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  return json.loads(resp.read().decode())
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return json.loads(resp.read().decode())
+              except urllib.error.HTTPError as e:
+                  # Print only the error code, never response body (could echo back request params)
+                  print("UPWORK_TOKEN_REFRESH_HTTP_ERROR_CODE:", e.code)
+                  raise
 
           # ---------- GitHub Secrets (libsodium sealed box) ----------
 
