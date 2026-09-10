@@ -39,6 +39,7 @@ jobs:
           import datetime
           import json
           import os
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -164,6 +165,7 @@ jobs:
               data = urllib.parse.urlencode({
                   "chat_id": telegram_chat_id,
                   "text": text,
+                  "parse_mode": "HTML",
                   "disable_web_page_preview": "true",
               }).encode()
               req = urllib.request.Request(TELEGRAM_API, data=data, method="POST")
@@ -173,17 +175,99 @@ jobs:
               except urllib.error.HTTPError:
                   return False
 
-          def chunk_text(text, limit=3800):
-              chunks = []
-              while len(text) > limit:
-                  cut = text.rfind("\n\n", 0, limit)
-                  if cut == -1:
-                      cut = limit
-                  chunks.append(text[:cut])
-                  text = text[cut:]
-              if text:
-                  chunks.append(text)
-              return chunks
+          def esc(value):
+              return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+          def posted_ago(job):
+              ts = job.get("published_date") or job.get("created_date")
+              if not ts:
+                  return None
+              try:
+                  posted = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                  now = datetime.datetime.now(datetime.timezone.utc)
+                  secs = (now - posted).total_seconds()
+                  if secs < 60:
+                      return "just now"
+                  mins = int(secs // 60)
+                  if mins < 60:
+                      return f"{mins} minute{'s' if mins != 1 else ''} ago"
+                  hours = int(secs // 3600)
+                  if hours < 24:
+                      return f"{hours} hour{'s' if hours != 1 else ''} ago"
+                  days = int(secs // 86400)
+                  return f"{days} day{'s' if days != 1 else ''} ago"
+              except ValueError:
+                  return None
+
+          EXP_LABELS = {"entry_level": "Entry", "intermediate": "Intermediate", "expert": "Expert"}
+
+          def build_job_message(job):
+              lines = [f"<b>{esc(job.get('title', '(no title)'))}</b>"]
+
+              posted = posted_ago(job)
+              if posted:
+                  lines.append(f"<b>Posted:</b> {posted}")
+
+              budget = job.get("budget")
+              job_type = job.get("job_type")
+              if budget:
+                  if job_type == "fixed":
+                      lines.append(f"<b>Budget:</b> ${esc(budget)} fixed")
+                  elif job_type == "hourly":
+                      lines.append(f"<b>Budget:</b> ${esc(budget)}")
+                  else:
+                      lines.append(f"<b>Budget:</b> {esc(budget)}")
+
+              ph_bits = []
+              if job.get("proposal_count") is not None:
+                  ph_bits.append(f"<b>Proposals:</b> {job['proposal_count']}")
+              if job.get("freelancers_to_hire") is not None:
+                  ph_bits.append(f"<b>Hiring:</b> {job['freelancers_to_hire']}")
+              if ph_bits:
+                  lines.append(" | ".join(ph_bits))
+
+              client = job.get("client") or {}
+              client_bits = []
+              if client.get("country"):
+                  client_bits.append(esc(client["country"]))
+              if client.get("verification_status"):
+                  verified = str(client["verification_status"]).upper() == "VERIFIED"
+                  client_bits.append("Payment verified" if verified else "Payment unverified")
+              if client_bits:
+                  lines.append("<b>Client:</b> " + " · ".join(client_bits))
+
+              if client.get("rating") is not None:
+                  if client.get("total_reviews") is not None:
+                      lines.append(f"<b>Rating:</b> {client['rating']}★ ({client['total_reviews']} reviews)")
+                  else:
+                      lines.append(f"<b>Rating:</b> {client['rating']}★")
+
+              if client.get("total_spent"):
+                  lines.append(f"<b>Total spent:</b> {esc(client['total_spent'])}")
+
+              exp_raw = job.get("experience_level")
+              if exp_raw:
+                  lines.append(f"<b>Experience:</b> {EXP_LABELS.get(exp_raw, str(exp_raw).replace('_', ' ').title())}")
+
+              if job.get("duration"):
+                  lines.append(f"<b>Duration:</b> {esc(job['duration'])}")
+
+              skills = job.get("skills") or []
+              if skills:
+                  lines.append(f"<b>Skills:</b> {esc(', '.join(skills))}")
+
+              desc = (job.get("description_snippet") or "").replace(
+                  "<untrusted_participant_content>", ""
+              ).replace("</untrusted_participant_content>", "").strip()
+              if desc:
+                  if len(desc) > 150:
+                      desc = desc[:150].rstrip() + "..."
+                  lines.append(f"<b>Description:</b> {esc(desc)}")
+
+              if job.get("url"):
+                  lines.append(esc(job["url"]))
+
+              return "\n".join(lines)
 
           # ---------- Step 1: use existing token, refresh only if needed ----------
 
@@ -204,7 +288,6 @@ jobs:
               new_access = token_response["access_token"]
               new_refresh = token_response.get("refresh_token", refresh_token)
 
-              # Mask secret values in the log stream before printing anything else.
               print(f"::add-mask::{new_access}")
               print(f"::add-mask::{new_refresh}")
 
@@ -261,7 +344,7 @@ jobs:
                                   break
                           org_uid = chosen.get("org_uid") or chosen.get("orgUid") or chosen.get("id")
           except Exception:
-              pass  # deliberately not printed — this branch never handles job/account content in logs
+              pass  # deliberately not printed — never surfaces account/job content in logs
 
           TOOL_ARGUMENTS = {
               "action": "search",
@@ -368,25 +451,21 @@ jobs:
           print("JOBS_CHECKED:", len(raw_jobs))
           print("JOBS_PASSED_FILTER:", len(kept))
 
-          # ---------- Step 4: private delivery to Telegram only — never printed, never uploaded ----------
+          # ---------- Step 4: private delivery to Telegram only — one message per job ----------
 
-          telegram_ok = True
-          if kept:
-              lines = [f"Upwork search: {len(kept)} job(s) passed your filters\n"]
-              for job in kept:
-                  lines.append(
-                      f"{job.get('title', '(no title)')}\n"
-                      f"Budget: {job.get('budget', 'n/a')} ({job.get('job_type', 'n/a')})\n"
-                      f"Client: {job.get('client', {}).get('country', 'n/a')}"
-                      + (f", {job.get('client', {}).get('rating')}★" if job.get('client', {}).get('rating') else "")
-                      + f"\n{job.get('url', '')}\n"
-                  )
-              message = "\n".join(lines)
-              for chunk in chunk_text(message):
-                  ok = send_telegram(chunk)
-                  telegram_ok = telegram_ok and ok
-          else:
-              telegram_ok = send_telegram("Upwork search: 0 jobs passed your filters this run.")
+          sent_ok = 0
+          sent_fail = 0
+          for job in kept:
+              ok = send_telegram(build_job_message(job))
+              if ok:
+                  sent_ok += 1
+              else:
+                  sent_fail += 1
+              time.sleep(0.5)
 
-          print("TELEGRAM_SEND:", "success" if telegram_ok else "failed")
+          if not kept:
+              send_telegram("Upwork search: 0 jobs passed your filters this run.")
+
+          print("TELEGRAM_MESSAGES_SENT:", sent_ok)
+          print("TELEGRAM_MESSAGES_FAILED:", sent_fail)
           PYEOF
