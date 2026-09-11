@@ -31,7 +31,7 @@ jobs:
           GH_SECRETS_ADMIN_PAT: ${{ secrets.GH_SECRETS_ADMIN_PAT }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MONITORING_STATE: ${{ secrets.MONITORING_STATE }}
+          STATE_READ_SECRET: ${{ secrets.STATE_READ_SECRET }}
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           GH_REPO_SLUG: ${{ github.repository }}
         run: |
@@ -59,13 +59,40 @@ jobs:
           refresh_token = os.environ["UPWORK_REFRESH_TOKEN"]
           admin_pat = os.environ["GH_SECRETS_ADMIN_PAT"]
           telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          state_read_secret = os.environ["STATE_READ_SECRET"]
           force_refresh = os.environ.get("FORCE_REFRESH", "false").lower() == "true"
 
-          # MONITORING_STATE is owned by telegram-control.yml — this workflow only
-          # reads it (never writes it, never calls Telegram getUpdates, never
-          # touches TELEGRAM_LAST_UPDATE_ID). Defaults to ON if the secret
-          # doesn't exist yet for some reason.
-          monitoring_state = os.environ.get("MONITORING_STATE") or "ON"
+          # Cloudflare Worker /state endpoint is the single source of truth for
+          # pause/resume, backed by Cloudflare KV and updated only by Telegram
+          # /pause and /resume commands. This workflow only reads it (GET,
+          # authenticated with a shared secret separate from the Telegram
+          # webhook secret) and never writes it. Any failure to reach it, an
+          # unexpected HTTP status, or a body that isn't exactly "ON"/"OFF" is
+          # treated as fail-closed (same as OFF) — never assume ON on error.
+          STATE_URL = "https://hermes-telegram-webhook.ahmedel-freelancer.workers.dev/state"
+
+          def fetch_monitoring_state():
+              req = urllib.request.Request(
+                  STATE_URL,
+                  headers={"X-State-Read-Secret": state_read_secret},
+                  method="GET",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      if resp.status != 200:
+                          print("STATE_FETCH_HTTP_STATUS:", resp.status)
+                          return None
+                      body = resp.read().decode().strip()
+                      if body not in ("ON", "OFF"):
+                          print("STATE_FETCH_INVALID_BODY")
+                          return None
+                      return body
+              except urllib.error.HTTPError as e:
+                  print("STATE_FETCH_HTTP_ERROR_CODE:", e.code)
+                  return None
+              except Exception as e:
+                  print("STATE_FETCH_ERROR:", type(e).__name__)
+                  return None
 
           # ---------- MCP helpers (read-only calls only) ----------
 
@@ -285,15 +312,21 @@ jobs:
 
               return "\n".join(lines)
 
-          # ---------- Step 0: respect the pause/resume state owned by telegram-control.yml ----------
-          # This workflow NEVER calls Telegram getUpdates and NEVER writes
-          # MONITORING_STATE — that's telegram-control.yml's job exclusively.
-          # This is a read-only check so a manual run still honors /pause.
+          # ---------- Step 0: fail-closed check against the Cloudflare /state endpoint ----------
+          # This workflow NEVER calls Telegram getUpdates and NEVER writes to
+          # Cloudflare KV — /pause and /resume are handled exclusively by the
+          # Cloudflare Worker. This read-only check runs before any Upwork MCP
+          # call (including the token probe/refresh below), so a paused or
+          # unreachable state guarantees zero Upwork MCP calls this run.
 
-          print("MONITORING_STATE:", monitoring_state)
+          monitoring_state = fetch_monitoring_state()
+          print("MONITORING_STATE:", monitoring_state if monitoring_state else "UNAVAILABLE")
 
           if monitoring_state != "ON":
-              print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls). Use /resume in Telegram, then re-run this workflow manually.")
+              if monitoring_state == "OFF":
+                  print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls). Use /resume in Telegram, then re-run this workflow manually.")
+              else:
+                  print("STATE_UNAVAILABLE_OR_INVALID — failing closed, skipping Upwork search this run (zero Upwork MCP/search calls).")
               raise SystemExit(0)
 
           # ---------- Step 1: use existing token, refresh only if needed ----------
