@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
         run: pip install --quiet pynacl
 
-      - name: Check Telegram control commands, refresh Upwork OAuth if needed, run ONE read-only search, filter, deliver privately to Telegram (no job data in logs/artifacts)
+      - name: Check monitoring state, refresh Upwork OAuth if needed, run ONE read-only search, filter, deliver privately to Telegram (no job data in logs/artifacts)
         env:
           UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
           UPWORK_REFRESH_TOKEN: ${{ secrets.UPWORK_REFRESH_TOKEN }}
@@ -32,7 +32,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MONITORING_STATE: ${{ secrets.MONITORING_STATE }}
-          TELEGRAM_LAST_UPDATE_ID: ${{ secrets.TELEGRAM_LAST_UPDATE_ID }}
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           GH_REPO_SLUG: ${{ github.repository }}
         run: |
@@ -55,7 +54,6 @@ jobs:
           UPWORK_RESOURCE = "https://mcp.upwork.com/mcp"
           MCP_URL = "https://mcp.upwork.com/mcp"
           TELEGRAM_SEND_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-          TELEGRAM_GETUPDATES_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/getUpdates"
 
           access_token = os.environ["UPWORK_ACCESS_TOKEN"]
           refresh_token = os.environ["UPWORK_REFRESH_TOKEN"]
@@ -63,10 +61,11 @@ jobs:
           telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
           force_refresh = os.environ.get("FORCE_REFRESH", "false").lower() == "true"
 
-          # MONITORING_STATE / TELEGRAM_LAST_UPDATE_ID secrets may not exist yet on first run —
-          # default to monitoring ON and offset 0 in that case.
+          # MONITORING_STATE is owned by telegram-control.yml — this workflow only
+          # reads it (never writes it, never calls Telegram getUpdates, never
+          # touches TELEGRAM_LAST_UPDATE_ID). Defaults to ON if the secret
+          # doesn't exist yet for some reason.
           monitoring_state = os.environ.get("MONITORING_STATE") or "ON"
-          last_update_id = int(os.environ.get("TELEGRAM_LAST_UPDATE_ID") or "0")
 
           # ---------- MCP helpers (read-only calls only) ----------
 
@@ -192,21 +191,6 @@ jobs:
               except urllib.error.HTTPError:
                   return False
 
-          # ---------- Telegram control commands (/pause, /resume, /status) ----------
-
-          def get_telegram_updates(offset):
-              params = urllib.parse.urlencode({
-                  "offset": offset,
-                  "timeout": 0,
-                  "allowed_updates": json.dumps(["message"]),
-              })
-              req = urllib.request.Request(f"{TELEGRAM_GETUPDATES_API}?{params}", method="GET")
-              try:
-                  with urllib.request.urlopen(req, timeout=15) as resp:
-                      return json.loads(resp.read().decode())
-              except Exception:
-                  return {"ok": False, "result": []}
-
           def esc(value):
               return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -301,72 +285,15 @@ jobs:
 
               return "\n".join(lines)
 
-          # ---------- Step 0: Telegram control commands — checked at the start of every run ----------
-          # Only /pause, /resume, /status are implemented. Commands from any chat other than
-          # TELEGRAM_CHAT_ID are ignored entirely (no reply, no state change). No job/account
-          # data or chat identifiers are ever printed here — only command names and counts.
-
-          updates_resp = get_telegram_updates(last_update_id + 1)
-          updates = updates_resp.get("result", []) if updates_resp.get("ok") else []
-
-          new_last_update_id = last_update_id
-          state_changed = False
-          commands_processed = []
-          unauthorized_ignored = 0
-
-          for upd in updates:
-              uid = upd.get("update_id")
-              if isinstance(uid, int) and uid > new_last_update_id:
-                  new_last_update_id = uid
-
-              msg = upd.get("message") or {}
-              chat = msg.get("chat") or {}
-              text = (msg.get("text") or "").strip()
-              if not text:
-                  continue
-
-              # Normalize: take the first token, strip any "@botname" suffix, lowercase it.
-              cmd = text.split()[0].split("@")[0].lower()
-
-              if str(chat.get("id", "")) != str(telegram_chat_id):
-                  unauthorized_ignored += 1
-                  continue
-
-              if cmd == "/pause":
-                  if monitoring_state != "OFF":
-                      monitoring_state = "OFF"
-                      state_changed = True
-                  send_telegram("⏸ Upwork monitoring paused.")
-                  commands_processed.append("pause")
-              elif cmd == "/resume":
-                  if monitoring_state != "ON":
-                      monitoring_state = "ON"
-                      state_changed = True
-                  send_telegram("▶️ Upwork monitoring resumed.")
-                  commands_processed.append("resume")
-              elif cmd == "/status":
-                  send_telegram("🟢 Monitoring ON" if monitoring_state == "ON" else "⏸ Monitoring PAUSED")
-                  commands_processed.append("status")
-              # Any other command/text from the authorized chat is silently ignored —
-              # no additional commands are implemented without Ahmed's explicit approval.
-
-          print("TELEGRAM_UPDATES_FETCHED:", len(updates))
-          print("TELEGRAM_COMMANDS_PROCESSED:", commands_processed)
-          print("TELEGRAM_UNAUTHORIZED_IGNORED:", unauthorized_ignored)
-
-          if new_last_update_id != last_update_id or state_changed:
-              key_info = get_repo_public_key()
-              if new_last_update_id != last_update_id:
-                  s_off = put_secret("TELEGRAM_LAST_UPDATE_ID", str(new_last_update_id), key_info["key_id"], key_info["key"])
-                  print("SECRET_UPDATE_HTTP_STATUS_LAST_UPDATE_ID:", s_off)
-              if state_changed:
-                  s_state = put_secret("MONITORING_STATE", monitoring_state, key_info["key_id"], key_info["key"])
-                  print("SECRET_UPDATE_HTTP_STATUS_MONITORING_STATE:", s_state)
+          # ---------- Step 0: respect the pause/resume state owned by telegram-control.yml ----------
+          # This workflow NEVER calls Telegram getUpdates and NEVER writes
+          # MONITORING_STATE — that's telegram-control.yml's job exclusively.
+          # This is a read-only check so a manual run still honors /pause.
 
           print("MONITORING_STATE:", monitoring_state)
 
           if monitoring_state != "ON":
-              print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls).")
+              print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls). Use /resume in Telegram, then re-run this workflow manually.")
               raise SystemExit(0)
 
           # ---------- Step 1: use existing token, refresh only if needed ----------
@@ -510,8 +437,8 @@ jobs:
                   job.get("title", "") or "",
                   " ".join(job.get("skills") or []),
                   (job.get("description_snippet", "") or "")
-                      .replace("<untrusted_participant_content>", "")
-                      .replace("</untrusted_participant_content>", ""),
+                  .replace("<untrusted_participant_content>", "")
+                  .replace("</untrusted_participant_content>", ""),
               ]).lower()
               for kw in EXCLUDE_KEYWORDS:
                   if kw in text:
