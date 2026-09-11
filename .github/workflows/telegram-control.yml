@@ -1,0 +1,192 @@
+name: Telegram Control (pause/resume/status — no Upwork/MCP/Hermes/Groq code path)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  telegram-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
+        run: pip install --quiet pynacl
+
+      - name: Check Telegram for /pause, /resume, /status and persist monitoring state (zero Upwork/MCP/Hermes/Groq calls)
+        env:
+          GH_SECRETS_ADMIN_PAT: ${{ secrets.GH_SECRETS_ADMIN_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MONITORING_STATE: ${{ secrets.MONITORING_STATE }}
+          TELEGRAM_LAST_UPDATE_ID: ${{ secrets.TELEGRAM_LAST_UPDATE_ID }}
+          GH_REPO_SLUG: ${{ github.repository }}
+        run: |
+          python3 - <<'PYEOF'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          from nacl import encoding, public
+
+          # ---------------------------------------------------------------
+          # This script talks ONLY to two APIs: Telegram's Bot API and
+          # GitHub's Secrets API. There is no import, call, URL, or code
+          # path anywhere in this file that touches Upwork, the Upwork MCP,
+          # Hermes, or Groq. That separation is structural, not just a
+          # comment: nothing here even knows those systems exist.
+          # ---------------------------------------------------------------
+
+          REPO = os.environ["GH_REPO_SLUG"]
+          GH_API = f"https://api.github.com/repos/{REPO}/actions/secrets"
+          TELEGRAM_SEND_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          TELEGRAM_GETUPDATES_API = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/getUpdates"
+
+          admin_pat = os.environ["GH_SECRETS_ADMIN_PAT"]
+          telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          # MONITORING_STATE / TELEGRAM_LAST_UPDATE_ID may not exist as secrets yet
+          # on the very first run — default to monitoring ON and offset 0.
+          monitoring_state = os.environ.get("MONITORING_STATE") or "ON"
+          last_update_id = int(os.environ.get("TELEGRAM_LAST_UPDATE_ID") or "0")
+
+          def get_telegram_updates(offset):
+              # Passing offset = (highest update_id we've processed) + 1 is
+              # Telegram's own documented mechanism for "give me only what's
+              # new AND mark everything up to here as received" — this is
+              # what guarantees an already-handled /pause or /resume is never
+              # re-processed on a later run, even if Telegram redelivers it.
+              params = urllib.parse.urlencode({
+                  "offset": offset,
+                  "timeout": 0,
+                  "allowed_updates": json.dumps(["message"]),
+              })
+              req = urllib.request.Request(f"{TELEGRAM_GETUPDATES_API}?{params}", method="GET")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return json.loads(resp.read().decode())
+              except Exception:
+                  return {"ok": False, "result": []}
+
+          def send_telegram(text):
+              data = urllib.parse.urlencode({
+                  "chat_id": telegram_chat_id,
+                  "text": text,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": "true",
+              }).encode()
+              req = urllib.request.Request(TELEGRAM_SEND_API, data=data, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.status == 200
+              except urllib.error.HTTPError:
+                  return False
+
+          def get_repo_public_key():
+              req = urllib.request.Request(
+                  f"{GH_API}/public-key",
+                  headers={
+                      "Authorization": f"Bearer {admin_pat}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode())
+
+          def encrypt_secret(public_key_b64, secret_value):
+              pk = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+              box = public.SealedBox(pk)
+              encrypted = box.encrypt(secret_value.encode("utf-8"))
+              return base64.b64encode(encrypted).decode("utf-8")
+
+          def put_secret(name, value, key_id, public_key_b64):
+              enc = encrypt_secret(public_key_b64, value)
+              payload = json.dumps({"encrypted_value": enc, "key_id": key_id}).encode()
+              req = urllib.request.Request(
+                  f"{GH_API}/{name}", data=payload,
+                  headers={
+                      "Authorization": f"Bearer {admin_pat}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+                  method="PUT",
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return resp.status
+
+          # ---------- Telegram control commands (/pause, /resume, /status) ----------
+          # Only these three are implemented. Commands from any chat other than
+          # TELEGRAM_CHAT_ID are ignored entirely (no reply, no state change).
+          # No job/account data or chat identifiers are ever printed — only
+          # command names and counts.
+
+          updates_resp = get_telegram_updates(last_update_id + 1)
+          updates = updates_resp.get("result", []) if updates_resp.get("ok") else []
+
+          new_last_update_id = last_update_id
+          state_changed = False
+          commands_processed = []
+          unauthorized_ignored = 0
+
+          for upd in updates:
+              uid = upd.get("update_id")
+              if isinstance(uid, int) and uid > new_last_update_id:
+                  new_last_update_id = uid
+
+              msg = upd.get("message") or {}
+              chat = msg.get("chat") or {}
+              text = (msg.get("text") or "").strip()
+              if not text:
+                  continue
+
+              cmd = text.split()[0].split("@")[0].lower()
+
+              if str(chat.get("id", "")) != str(telegram_chat_id):
+                  unauthorized_ignored += 1
+                  continue
+
+              if cmd == "/pause":
+                  if monitoring_state != "OFF":
+                      monitoring_state = "OFF"
+                      state_changed = True
+                  send_telegram("⏸ Upwork monitoring paused.")
+                  commands_processed.append("pause")
+              elif cmd == "/resume":
+                  if monitoring_state != "ON":
+                      monitoring_state = "ON"
+                      state_changed = True
+                  send_telegram("▶️ Upwork monitoring resumed.")
+                  commands_processed.append("resume")
+              elif cmd == "/status":
+                  send_telegram("🟢 Monitoring ON" if monitoring_state == "ON" else "⏸ Monitoring PAUSED")
+                  commands_processed.append("status")
+              # Any other command/text from the authorized chat is silently ignored —
+              # no additional commands are implemented without Ahmed's explicit approval.
+
+          print("TELEGRAM_UPDATES_FETCHED:", len(updates))
+          print("TELEGRAM_COMMANDS_PROCESSED:", commands_processed)
+          print("TELEGRAM_UNAUTHORIZED_IGNORED:", unauthorized_ignored)
+
+          if new_last_update_id != last_update_id or state_changed:
+              key_info = get_repo_public_key()
+              if new_last_update_id != last_update_id:
+                  s_off = put_secret("TELEGRAM_LAST_UPDATE_ID", str(new_last_update_id), key_info["key_id"], key_info["key"])
+                  print("SECRET_UPDATE_HTTP_STATUS_LAST_UPDATE_ID:", s_off)
+              if state_changed:
+                  s_state = put_secret("MONITORING_STATE", monitoring_state, key_info["key_id"], key_info["key"])
+                  print("SECRET_UPDATE_HTTP_STATUS_MONITORING_STATE:", s_state)
+          else:
+              print("No new Telegram updates and no state change this run — no secret writes.")
+
+          print("MONITORING_STATE:", monitoring_state)
+          PYEOF
