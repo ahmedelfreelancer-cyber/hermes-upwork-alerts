@@ -24,36 +24,6 @@ jobs:
       - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
         run: pip install --quiet pynacl
 
-      - name: TEMP DIAGNOSTIC - verify STATE_READ_SECRET presence/length and test /state via curl (no secret values, tokens, or headers ever logged)
-        env:
-          STATE_READ_SECRET: ${{ secrets.STATE_READ_SECRET }}
-        run: |
-          set +x
-          if [ -z "${STATE_READ_SECRET}" ]; then
-            echo "STATE_READ_SECRET_SET: false"
-          else
-            echo "STATE_READ_SECRET_SET: true"
-          fi
-          echo "STATE_READ_SECRET_LENGTH: ${#STATE_READ_SECRET}"
-
-          HTTP_STATUS=$(curl -s -o /tmp/state_body.txt -w "%{http_code}" \
-            -H "X-State-Read-Secret: ${STATE_READ_SECRET}" \
-            -H "User-Agent: Mozilla/5.0 (compatible; HermesStateDiagnostic/1.0)" \
-            "https://hermes-telegram-webhook.ahmedel-freelancer.workers.dev/state")
-
-          echo "CURL_STATE_HTTP_STATUS: ${HTTP_STATUS}"
-
-          if [ "${HTTP_STATUS}" = "200" ]; then
-            BODY="$(cat /tmp/state_body.txt)"
-            if [ "${BODY}" = "ON" ] || [ "${BODY}" = "OFF" ]; then
-              echo "CURL_STATE_BODY: ${BODY}"
-            else
-              echo "CURL_STATE_BODY: <non-ON/OFF body, not logging content>"
-            fi
-          fi
-
-          rm -f /tmp/state_body.txt
-
       - name: Check monitoring state, refresh Upwork OAuth if needed, run ONE read-only search, filter, deliver privately to Telegram (no job data in logs/artifacts)
         env:
           UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
@@ -104,7 +74,10 @@ jobs:
           def fetch_monitoring_state():
               req = urllib.request.Request(
                   STATE_URL,
-                  headers={"X-State-Read-Secret": state_read_secret},
+                  headers={
+                      "X-State-Read-Secret": state_read_secret,
+                      "User-Agent": "Mozilla/5.0 (compatible; HermesState/1.0)",
+                  },
                   method="GET",
               )
               try:
