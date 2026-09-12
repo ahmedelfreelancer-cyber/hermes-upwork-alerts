@@ -919,8 +919,14 @@ jobs:
               if niches is not None:
                   candidates.append((job, niches))
 
+          # Captured BEFORE the dedup stage reassigns `candidates`. This
+          # pre-dedup count is what the "no relevant jobs" status message
+          # below keys off — see the note there for why the post-dedup
+          # count would be the wrong signal.
+          jobs_passed_filter = len(candidates)
+
           print("JOBS_CHECKED:", len(raw_jobs))
-          print("JOBS_PASSED_FILTER:", len(candidates))
+          print("JOBS_PASSED_FILTER:", jobs_passed_filter)
 
           # Dedup: claim before send, batched in one call. Fail-closed on
           # error (claim_job_ids returns an empty set), meaning a Worker/
@@ -957,6 +963,30 @@ jobs:
           # An empty claimed set here is the normal "everything already
           # seen" case — nothing to send, run stays green.
           print("JOBS_CLAIMED_NEW:", len(candidates))
+
+          # ---------- Status notification: healthy run, nothing relevant ----------
+          # Exactly one message, and only when the run got this far in good
+          # health. Every condition that would make the statement false or
+          # misleading has already exited before this line: monitoring
+          # paused (exit 0), unreadable/corrupt control-plane state (exit
+          # 1), all three searches failed (exit 1), auth failure (raises),
+          # dedup failure (exit 1). So reaching here means: state was ON,
+          # at least one search succeeded, and filtering completed.
+          #
+          # Keyed on jobs_passed_filter — the PRE-dedup count — never on
+          # JOBS_CLAIMED_NEW or TELEGRAM_MESSAGES_SENT. A job can pass the
+          # filter and still be suppressed because it was already claimed
+          # on an earlier run; in that case silence is the correct output
+          # and saying "no relevant jobs matched" would be false.
+          #
+          # Delivery is best-effort: send_telegram_with_retry() returns a
+          # bool and never raises, so a Telegram outage cannot fail the
+          # run. Only that bool is logged — no job or client content.
+          if jobs_passed_filter == 0:
+              status_sent = send_telegram_with_retry(
+                  "🔎 Search complete\n\nNo relevant jobs matched your filters this run."
+              )
+              print("STATUS_MESSAGE_SENT:", status_sent)
 
           # ---------- Step 4: private delivery to Telegram only — one message per job ----------
           # Uses the retrying sender (send_telegram_with_retry) since a claim
