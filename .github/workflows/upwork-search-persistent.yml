@@ -8,6 +8,17 @@ on:
         type: boolean
         default: false
 
+# Only one run of this workflow should ever be in flight at a time -- the
+# claim-before-send dedup design (see /dedup/claim in the Cloudflare Worker)
+# relies on there being no concurrent writer, since Cloudflare KV has no
+# atomic compare-and-swap. cancel-in-progress is deliberately false: if a
+# run is already in progress, a newly triggered run queues behind it rather
+# than cancelling it mid-flight (which could leave a job claimed but never
+# sent, or a search half-completed).
+concurrency:
+  group: upwork-search
+  cancel-in-progress: false
+
 jobs:
   upwork-search:
     runs-on: ubuntu-latest
@@ -24,7 +35,7 @@ jobs:
       - name: Install dependencies (PyNaCl, for GitHub Secrets sealed-box encryption)
         run: pip install --quiet pynacl
 
-      - name: Check monitoring state, refresh Upwork OAuth if needed, run ONE read-only search, filter, deliver privately to Telegram (no job data in logs/artifacts)
+      - name: Check monitoring state, refresh Upwork OAuth if needed, run three read-only searches, filter, deliver privately to Telegram (no job data in logs/artifacts)
         env:
           UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
           UPWORK_REFRESH_TOKEN: ${{ secrets.UPWORK_REFRESH_TOKEN }}
@@ -32,6 +43,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATE_READ_SECRET: ${{ secrets.STATE_READ_SECRET }}
+          DEDUP_SECRET: ${{ secrets.DEDUP_SECRET }}
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           GH_REPO_SLUG: ${{ github.repository }}
         run: |
@@ -40,6 +52,7 @@ jobs:
           import datetime
           import json
           import os
+          import re
           import time
           import urllib.error
           import urllib.parse
@@ -60,18 +73,44 @@ jobs:
           admin_pat = os.environ["GH_SECRETS_ADMIN_PAT"]
           telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"]
           state_read_secret = os.environ["STATE_READ_SECRET"]
+          dedup_secret = os.environ["DEDUP_SECRET"]
           force_refresh = os.environ.get("FORCE_REFRESH", "false").lower() == "true"
 
           # Cloudflare Worker /state endpoint is the single source of truth for
           # pause/resume, backed by Cloudflare KV and updated only by Telegram
           # /pause and /resume commands. This workflow only reads it (GET,
-          # authenticated with a shared secret separate from the Telegram
-          # webhook secret) and never writes it. Any failure to reach it, an
-          # unexpected HTTP status, or a body that isn't exactly "ON"/"OFF" is
-          # treated as fail-closed (same as OFF) — never assume ON on error.
+          # authenticated with a shared secret separate from both the Telegram
+          # webhook secret and the dedup secret) and never writes it. The body
+          # is now a JSON object {"state": "ON"|"OFF", "resume_timestamp":
+          # <ISO-8601 string>|null} written atomically by the Worker so state
+          # can never be ON without a resume_timestamp attached. Any failure
+          # to reach it, an unexpected HTTP status, or a body that doesn't
+          # parse into that shape is treated as fail-closed (same as OFF) —
+          # never assume ON on error.
           STATE_URL = "https://hermes-telegram-webhook.ahmedel-freelancer.workers.dev/state"
 
-          def fetch_monitoring_state():
+          # Dedup claim endpoint — write access, separate secret from /state
+          # on purpose (different blast radius if leaked). "Claiming" an id
+          # here, before any Telegram send, is the entire dedup mechanism:
+          # there is no separate "mark seen" call afterward, so nothing that
+          # happens after a successful claim (a Telegram outage, a crash) can
+          # cause the same job to be re-sent on a later run. The accepted
+          # trade-off: a send that fails after a successful claim loses that
+          # one alert rather than risking a duplicate — see the retry around
+          # send_telegram below, which exists specifically to shrink that
+          # window without reopening the duplicate risk.
+          DEDUP_CLAIM_URL = "https://hermes-telegram-webhook.ahmedel-freelancer.workers.dev/dedup/claim"
+
+          # Confirmed by Ahmed from the one-run JOB_FIELD_NAMES_SAMPLE
+          # diagnostic: "id" is Upwork's native stable job identifier
+          # returned by find_jobs. Defined here, in the constants section,
+          # because it's needed by Step 2's merge-by-id loop below — it
+          # must exist before that code runs, not just before Step 3 (this
+          # was previously defined too late and would have raised
+          # NameError the first time Step 2 executed).
+          JOB_ID_FIELD = "id"
+
+          def fetch_monitoring():
               req = urllib.request.Request(
                   STATE_URL,
                   headers={
@@ -85,16 +124,74 @@ jobs:
                       if resp.status != 200:
                           print("STATE_FETCH_HTTP_STATUS:", resp.status)
                           return None
-                      body = resp.read().decode().strip()
-                      if body not in ("ON", "OFF"):
+                      raw_body = resp.read().decode().strip()
+                      try:
+                          data = json.loads(raw_body)
+                      except json.JSONDecodeError:
+                          print("STATE_FETCH_INVALID_JSON")
+                          return None
+                      if not isinstance(data, dict) or data.get("state") not in ("ON", "OFF"):
                           print("STATE_FETCH_INVALID_BODY")
                           return None
-                      return body
+                      return data
               except urllib.error.HTTPError as e:
                   print("STATE_FETCH_HTTP_ERROR_CODE:", e.code)
                   return None
               except Exception as e:
                   print("STATE_FETCH_ERROR:", type(e).__name__)
+                  return None
+
+          def claim_job_ids(ids):
+              # Contract — the caller MUST distinguish these two outcomes:
+              #   set()  (or a populated set) = SUCCESS. An empty set is a
+              #          legitimate "everything in this batch was already
+              #          seen"; send nothing, finish normally/green.
+              #   None                        = FAILURE. The dedup layer
+              #          itself is broken (network, auth, non-200, or a
+              #          response we can't trust). Send nothing AND fail
+              #          the run — otherwise a broken dedup layer looks
+              #          identical to a quiet run while real matches are
+              #          silently dropped.
+              # Fail-closed either way: nothing is ever sent unclaimed.
+              if not ids:
+                  # No candidates to claim at all — vacuously successful,
+                  # not a failure.
+                  return set()
+              req = urllib.request.Request(
+                  DEDUP_CLAIM_URL,
+                  data=json.dumps({"ids": ids}).encode(),
+                  headers={
+                      "X-Dedup-Secret": dedup_secret,
+                      "Content-Type": "application/json",
+                      "User-Agent": "Mozilla/5.0 (compatible; HermesDedup/1.0)",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      if resp.status != 200:
+                          print("DEDUP_CLAIM_HTTP_STATUS:", resp.status)
+                          return None
+                      data = json.loads(resp.read().decode())
+                      # Don't trust a 200 blindly: only a dict carrying a
+                      # "claimed" list of strings is a usable answer. Any
+                      # other shape is a FAILURE, not an empty claim — and
+                      # never coerced (set() over a str would silently
+                      # become a set of characters, and set() over a dict
+                      # a set of keys — both nonsense to match ids against).
+                      if not isinstance(data, dict):
+                          print("DEDUP_CLAIM_INVALID_RESPONSE")
+                          return None
+                      claimed = data.get("claimed")
+                      if not isinstance(claimed, list) or not all(isinstance(i, str) for i in claimed):
+                          print("DEDUP_CLAIM_INVALID_RESPONSE")
+                          return None
+                      return set(claimed)
+              except urllib.error.HTTPError as e:
+                  print("DEDUP_CLAIM_HTTP_ERROR_CODE:", e.code)
+                  return None
+              except Exception as e:
+                  print("DEDUP_CLAIM_ERROR:", type(e).__name__)
                   return None
 
           # ---------- MCP helpers (read-only calls only) ----------
@@ -218,15 +315,35 @@ jobs:
               try:
                   with urllib.request.urlopen(req, timeout=15) as resp:
                       return resp.status == 200
-              except urllib.error.HTTPError:
+              except Exception:
+                  # Any failure — HTTP error, network error, timeout,
+                  # connection reset — must return False here, never raise,
+                  # so send_telegram_with_retry() actually gets to make its
+                  # second attempt instead of the whole run crashing on a
+                  # transient network blip. Never logs message content or
+                  # exception details that could echo the text being sent.
                   return False
+
+          def send_telegram_with_retry(text, attempts=2, delay_seconds=1.5):
+              # Short retry only — a transient Telegram blip shouldn't cost an
+              # alert given claim-before-send already happened. Not a fix for
+              # a persistent outage, just insurance against a blip.
+              for attempt in range(1, attempts + 1):
+                  if send_telegram(text):
+                      return True
+                  if attempt < attempts:
+                      time.sleep(delay_seconds)
+              return False
 
           def esc(value):
               return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
           def posted_ago(job):
               ts = job.get("published_date") or job.get("created_date")
-              if not ts:
+              # Must be a non-empty string: a non-string value (an epoch
+              # int, a nested object) would make .replace() raise
+              # AttributeError, which ValueError alone would not catch.
+              if not isinstance(ts, str) or not ts:
                   return None
               try:
                   posted = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -242,36 +359,66 @@ jobs:
                       return f"{hours} hour{'s' if hours != 1 else ''} ago"
                   days = int(secs // 86400)
                   return f"{days} day{'s' if days != 1 else ''} ago"
-              except ValueError:
+              except (ValueError, TypeError):
                   return None
 
           EXP_LABELS = {"entry_level": "Entry", "intermediate": "Intermediate", "expert": "Expert"}
 
-          def build_job_message(job):
-              lines = [f"<b>{esc(job.get('title', '(no title)'))}</b>"]
+          def summarize_description(raw):
+              # Deterministic truncation only — no AI summarization call.
+              # Cuts at a word boundary so the result reads as a clean short
+              # blurb rather than a mid-word chop.
+              text = (raw or "").replace(
+                  "<untrusted_participant_content>", ""
+              ).replace("</untrusted_participant_content>", "")
+              text = " ".join(text.split())
+              if not text:
+                  return ""
+              max_len = 200
+              if len(text) <= max_len:
+                  return esc(text)
+              truncated = text[:max_len].rsplit(" ", 1)[0]
+              return esc(truncated) + "..."
 
+          def build_job_message(job, niches):
+              # Matched service terms are recomputed here (rather than passed
+              # in) since SERVICE_KEYWORDS/keyword_matches are defined later
+              # in this same script -- fine in Python, which resolves globals
+              # at call time, and this function is only ever called from
+              # Step 4, after Step 3's definitions have run.
+              text = job_text(job)
+              matched_services = [kw for kw in SERVICE_KEYWORDS if keyword_matches(text, kw)]
+
+              blocks = []
+
+              # Block 1: title -- always present, first thing seen.
+              # "or" rather than a .get default: an explicit null title
+              # would otherwise render the literal string "None".
+              blocks.append([f"🔔 <b>{esc(job.get('title') or '(no title)')}</b>"])
+
+              # Block 2: the three most important scan-first facts.
+              block2 = []
               posted = posted_ago(job)
               if posted:
-                  lines.append(f"<b>Posted:</b> {posted}")
-
+                  block2.append(f"🕒 <b>Posted:</b> {esc(posted)}")
               budget = job.get("budget")
               job_type = job.get("job_type")
               if budget:
                   if job_type == "fixed":
-                      lines.append(f"<b>Budget:</b> ${esc(budget)} fixed")
+                      block2.append(f"💰 <b>Budget:</b> ${esc(budget)} fixed")
                   elif job_type == "hourly":
-                      lines.append(f"<b>Budget:</b> ${esc(budget)}")
+                      block2.append(f"💰 <b>Budget:</b> ${esc(budget)}/hr")
                   else:
-                      lines.append(f"<b>Budget:</b> {esc(budget)}")
+                      block2.append(f"💰 <b>Budget:</b> {esc(budget)}")
+              if niches:
+                  block2.append(f"🏷 <b>Category:</b> {esc(', '.join(niches))}")
+              if block2:
+                  blocks.append(block2)
 
-              ph_bits = []
-              if job.get("proposal_count") is not None:
-                  ph_bits.append(f"<b>Proposals:</b> {job['proposal_count']}")
-              if job.get("freelancers_to_hire") is not None:
-                  ph_bits.append(f"<b>Hiring:</b> {job['freelancers_to_hire']}")
-              if ph_bits:
-                  lines.append(" | ".join(ph_bits))
-
+              # Block 3: match context + client details.
+              block3 = []
+              if matched_services:
+                  block3.append(f"🧩 <b>Service match:</b> {esc(', '.join(matched_services))}")
               client = job.get("client") or {}
               client_bits = []
               if client.get("country"):
@@ -280,40 +427,58 @@ jobs:
                   verified = str(client["verification_status"]).upper() == "VERIFIED"
                   client_bits.append("Payment verified" if verified else "Payment unverified")
               if client_bits:
-                  lines.append("<b>Client:</b> " + " · ".join(client_bits))
-
+                  block3.append(f"📍 <b>Client:</b> {' • '.join(client_bits)}")
+              # Every interpolated value below goes through esc(): the
+              # message is sent with parse_mode=HTML, so a stray "<" in any
+              # field makes Telegram reject the whole message with 400 and
+              # that alert — already claimed in KV — is lost for good.
+              # esc() is a no-op on the normal numeric values, so the
+              # rendered layout is unchanged.
               if client.get("rating") is not None:
                   if client.get("total_reviews") is not None:
-                      lines.append(f"<b>Rating:</b> {client['rating']}★ ({client['total_reviews']} reviews)")
+                      block3.append(f"⭐ <b>Rating:</b> {esc(client['rating'])}★ ({esc(client['total_reviews'])} reviews)")
                   else:
-                      lines.append(f"<b>Rating:</b> {client['rating']}★")
-
+                      block3.append(f"⭐ <b>Rating:</b> {esc(client['rating'])}★")
               if client.get("total_spent"):
-                  lines.append(f"<b>Total spent:</b> {esc(client['total_spent'])}")
-
+                  block3.append(f"💵 <b>Total spent:</b> {esc(client['total_spent'])}")
+              ph_bits = []
+              if job.get("proposal_count") is not None:
+                  ph_bits.append(f"<b>Proposals:</b> {esc(job['proposal_count'])}")
+              if job.get("freelancers_to_hire") is not None:
+                  ph_bits.append(f"<b>Hiring:</b> {esc(job['freelancers_to_hire'])}")
+              if ph_bits:
+                  block3.append(f"📈 {' | '.join(ph_bits)}")
               exp_raw = job.get("experience_level")
               if exp_raw:
-                  lines.append(f"<b>Experience:</b> {EXP_LABELS.get(exp_raw, str(exp_raw).replace('_', ' ').title())}")
-
+                  exp_label = EXP_LABELS.get(exp_raw, str(exp_raw).replace("_", " ").title())
+                  block3.append(f"🧠 <b>Experience:</b> {esc(exp_label)}")
               if job.get("duration"):
-                  lines.append(f"<b>Duration:</b> {esc(job['duration'])}")
+                  block3.append(f"⏳ <b>Duration:</b> {esc(job['duration'])}")
+              if block3:
+                  blocks.append(block3)
 
+              # Block 4: skills, capped at 5 per Ahmed's spec. Same
+              # non-list guard as job_text() — without it a bare string
+              # would be sliced into characters and rendered as
+              # "n, o, t, -, a" instead of the skill itself.
               skills = job.get("skills") or []
+              if not isinstance(skills, list):
+                  skills = [skills]
+              skills = [str(s) for s in skills][:5]
               if skills:
-                  lines.append(f"<b>Skills:</b> {esc(', '.join(skills))}")
+                  blocks.append([f"🛠 <b>Skills:</b> {esc(', '.join(skills))}"])
 
-              desc = (job.get("description_snippet") or "").replace(
-                  "<untrusted_participant_content>", ""
-              ).replace("</untrusted_participant_content>", "").strip()
-              if desc:
-                  if len(desc) > 150:
-                      desc = desc[:150].rstrip() + "..."
-                  lines.append(f"<b>Description:</b> {esc(desc)}")
+              # Block 5: short summary -- deterministic truncation, never a
+              # raw description dump.
+              summary = summarize_description(job.get("description_snippet"))
+              if summary:
+                  blocks.append(["📝 <b>Summary:</b>", summary])
 
+              # Block 6: apply link, own block so it's easy to tap.
               if job.get("url"):
-                  lines.append(esc(job["url"]))
+                  blocks.append(["🔗 <b>Apply:</b>", esc(job["url"])])
 
-              return "\n".join(lines)
+              return "\n\n".join("\n".join(block) for block in blocks)
 
           # ---------- Step 0: fail-closed check against the Cloudflare /state endpoint ----------
           # This workflow NEVER calls Telegram getUpdates and NEVER writes to
@@ -322,15 +487,43 @@ jobs:
           # call (including the token probe/refresh below), so a paused or
           # unreachable state guarantees zero Upwork MCP calls this run.
 
-          monitoring_state = fetch_monitoring_state()
+          monitoring = fetch_monitoring()
+          monitoring_state = monitoring.get("state") if monitoring else None
           print("MONITORING_STATE:", monitoring_state if monitoring_state else "UNAVAILABLE")
 
-          if monitoring_state != "ON":
-              if monitoring_state == "OFF":
-                  print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls). Use /resume in Telegram, then re-run this workflow manually.")
-              else:
-                  print("STATE_UNAVAILABLE_OR_INVALID — failing closed, skipping Upwork search this run (zero Upwork MCP/search calls).")
+          # Exit-code policy, for observability: a deliberate pause is a
+          # normal outcome and must stay GREEN, while a control plane we
+          # cannot read is an infrastructure failure and must go RED. Both
+          # are equally fail-closed — neither makes a single Upwork call.
+          # fetch_monitoring() only ever returns a dict whose state is
+          # exactly "ON"/"OFF", or None, so these three branches are total.
+          if monitoring_state == "OFF":
+              print("MONITORING_PAUSED — skipping Upwork search this run (zero Upwork MCP/search calls). Use /resume in Telegram, then re-run this workflow manually.")
               raise SystemExit(0)
+
+          if monitoring_state != "ON":
+              print("STATE_UNAVAILABLE_OR_INVALID — failing closed, skipping Upwork search this run (zero Upwork MCP/search calls). Failing the run: the pause/resume control plane could not be read, which is an infrastructure fault, not a paused state.")
+              raise SystemExit(1)
+
+          # An ON state is only ever meaningful together with a valid
+          # resume_timestamp — the Worker always writes them atomically, so
+          # if this one is missing or unparseable something is wrong (a bug,
+          # a manual KV edit, an old pre-migration key). Never treat that as
+          # "no restriction" — fail closed exactly like a paused/unavailable
+          # state, just with its own log line for diagnosis.
+          resume_timestamp_raw = monitoring.get("resume_timestamp")
+          resume_ts = None
+          if isinstance(resume_timestamp_raw, str) and resume_timestamp_raw:
+              try:
+                  resume_ts = datetime.datetime.fromisoformat(resume_timestamp_raw.replace("Z", "+00:00"))
+                  if resume_ts.tzinfo is None:
+                      resume_ts = resume_ts.replace(tzinfo=datetime.timezone.utc)
+              except ValueError:
+                  resume_ts = None
+
+          if resume_ts is None:
+              print("RESUME_TIMESTAMP_MISSING_OR_INVALID — failing closed, skipping Upwork search this run (zero Upwork MCP/search calls). Failing the run: an ON state without a usable resume timestamp is corrupted control-plane state, not a paused state.")
+              raise SystemExit(1)
 
           # ---------- Step 1: use existing token, refresh only if needed ----------
 
@@ -370,8 +563,14 @@ jobs:
 
           print("PERSISTENCE_RESULT:", "REFRESHED_AND_PERSISTED" if refreshed else "REUSED_EXISTING_VALID_TOKEN")
 
-          # ---------- Step 2: the one read-only search (same fixed criteria as before) ----------
+          # ---------- Step 2: three targeted read-only searches, merged and deduped by native job id ----------
           # Nothing from this point on that touches job/client content is printed. Only counts.
+          #
+          # One query per portfolio niche so Upwork's own relevance ranking
+          # surfaces good candidates for each — the query text only affects
+          # what gets retrieved, never the accept/reject decision, which is
+          # entirely the deterministic filter in Step 3 below, applied
+          # identically to every job regardless of which query returned it.
 
           status, sid, raw = mcp_post(current_access_token, {
               "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -409,58 +608,234 @@ jobs:
           except Exception:
               pass  # deliberately not printed — never surfaces account/job content in logs
 
-          TOOL_ARGUMENTS = {
-              "action": "search",
-              "org_uid": org_uid,
-              "params": {
-                  "query": "WordPress Elementor website redesign landing page WooCommerce",
-                  "budget_min": 250,
-                  "rate_min": 12,
-                  "verified_payment_only": True,
-                  "sort": "recency",
-                  "limit": 10,
-              },
-          }
+          SEARCH_QUERIES = [
+              ("Residential & home cleaning services",
+               "WordPress Elementor website cleaning company maid service house cleaning"),
+              ("Architecture & interior design studios",
+               "WordPress Elementor website architecture firm interior design studio"),
+              ("Fashion & clothing e-commerce brands",
+               "WordPress Elementor WooCommerce fashion clothing brand store"),
+          ]
 
-          _, _, raw3 = mcp_post(current_access_token, {
-              "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-              "params": {"name": "upwork__find_jobs", "arguments": TOOL_ARGUMENTS},
-          }, session_id=sid)
-          call_result = parse_body(raw3)
+          def run_search_query(mcp_id, query_label, query_text):
+              # Returns (ok, jobs). ok=False means this one query failed --
+              # the caller must NOT treat that the same as ok=True with an
+              # empty jobs list (an empty successful search is a legitimate
+              # "nothing matched right now"; a failed OR malformed response
+              # tells us nothing about what's actually out there and must
+              # never silently become an empty success). Only safe,
+              # content-free info is ever printed here: the query's own
+              # business-category label (not job data), and an HTTP/MCP
+              # error code, exception type name, or the literal
+              # INVALID_RESPONSE marker -- never response body content.
+              TOOL_ARGUMENTS = {
+                  "action": "search",
+                  "org_uid": org_uid,
+                  "params": {
+                      "query": query_text,
+                      "budget_min": 250,
+                      "rate_min": 12,
+                      "verified_payment_only": True,
+                      "sort": "recency",
+                      "limit": 10,
+                  },
+              }
+              try:
+                  _, _, raw_search = mcp_post(current_access_token, {
+                      "jsonrpc": "2.0", "id": mcp_id, "method": "tools/call",
+                      "params": {"name": "upwork__find_jobs", "arguments": TOOL_ARGUMENTS},
+                  }, session_id=sid)
+              except urllib.error.HTTPError as e:
+                  print(f"SEARCH_FAILED ({query_label}): HTTP_ERROR_CODE={e.code}")
+                  return False, []
+              except Exception as e:
+                  print(f"SEARCH_FAILED ({query_label}): {type(e).__name__}")
+                  return False, []
 
-          if "error" in call_result:
-              print("MCP_ERROR_CODE:", call_result["error"].get("code"))
-              raise SystemExit(0)
+              # Everything from here on — MCP-level error, malformed JSON,
+              # an unexpected shape, a missing/non-list "jobs" field — is
+              # inside this one try, so ANY parsing failure returns
+              # (False, []) for just this query rather than raising out of
+              # this function and aborting the other two searches.
+              try:
+                  call_result = parse_body(raw_search)
+                  if "error" in call_result:
+                      print(f"SEARCH_FAILED ({query_label}): MCP_ERROR_CODE={call_result['error'].get('code')}")
+                      return False, []
 
-          result = call_result.get("result", {})
-          content_blocks = result.get("content", [])
-          parsed = {}
-          for block in content_blocks:
-              if block.get("type") == "text":
-                  try:
-                      parsed = json.loads(block["text"])
-                  except json.JSONDecodeError:
-                      pass
+                  result = call_result.get("result", {})
+                  content_blocks = result.get("content", [])
+                  parsed = None
+                  for block in content_blocks:
+                      if block.get("type") == "text":
+                          parsed = json.loads(block["text"])
+                          break
 
-          raw_jobs = parsed.get("jobs", [])
+                  jobs = parsed.get("jobs") if isinstance(parsed, dict) else None
+                  if not isinstance(jobs, list):
+                      print(f"SEARCH_FAILED ({query_label}): INVALID_RESPONSE")
+                      return False, []
 
-          # TEMPORARY DIAGNOSTIC -- one manual run only, to identify the
-          # stable unique job-ID field before wiring up dedup. Prints only
-          # dict KEY NAMES from the first job, never any values (no title,
-          # client info, budget, or description). Remove immediately once
-          # the field is confirmed.
-          if raw_jobs:
-              print("JOB_FIELD_NAMES_SAMPLE:", sorted(raw_jobs[0].keys()))
-          else:
-              print("NO_JOBS_RETURNED_THIS_RUN")
+                  return True, jobs
+              except Exception:
+                  print(f"SEARCH_FAILED ({query_label}): INVALID_RESPONSE")
+                  return False, []
+
+          # Run all 3 targeted searches independently. One or two failing
+          # does NOT abort the run -- we continue with whatever succeeded.
+          # Only if all 3 fail do we abort without evaluating or sending
+          # anything (fail-closed). This is a deliberate, narrower
+          # fail-closed rule than Step 0/Step 1: those guard state/auth
+          # correctness (never search or send on bad state or a bad
+          # token), while this one is about not throwing away 1-2 good
+          # search results just because a third had a transient blip.
+          raw_jobs_by_id = {}
+          successful_queries = 0
+          failed_queries = 0
+          next_mcp_id = 3
+
+          for query_label, query_text in SEARCH_QUERIES:
+              ok, jobs_this_query = run_search_query(next_mcp_id, query_label, query_text)
+              next_mcp_id += 1
+              if not ok:
+                  failed_queries += 1
+                  continue
+              successful_queries += 1
+              for job in jobs_this_query:
+                  raw_job_id = job.get(JOB_ID_FIELD)
+                  if raw_job_id is None:
+                      # No stable id on this job -- can't merge-dedupe or
+                      # later claim it safely, so it's dropped here rather
+                      # than risking a duplicate alert.
+                      continue
+                  # Normalize to str immediately -- this exact string is
+                  # used as the local merge key here AND later sent to the
+                  # Cloudflare /dedup/claim endpoint, so both dedup layers
+                  # always agree on the same representation of a given id
+                  # (Upwork's own value could in principle come back as a
+                  # non-string on the wire; the Worker requires a string).
+                  job_id = str(raw_job_id)
+                  # Local merge-dedup across the successful queries happens
+                  # here, before any filtering: a job returned by more than
+                  # one query is kept only once, so it can only ever be
+                  # evaluated, claimed, and sent once this run.
+                  if job_id not in raw_jobs_by_id:
+                      raw_jobs_by_id[job_id] = job
+
+          print("SEARCH_QUERIES_SUCCEEDED:", successful_queries)
+          print("SEARCH_QUERIES_FAILED:", failed_queries)
+
+          if successful_queries == 0:
+              print("ALL_SEARCH_QUERIES_FAILED — aborting run, zero jobs evaluated, nothing sent.")
+              # Non-zero exit deliberately: all 3 searches failing is an
+              # infrastructure/search problem, not a normal "nothing to
+              # report" run, and must show as a failed run in GitHub
+              # Actions rather than a misleading green checkmark.
+              raise SystemExit(1)
+
+          raw_jobs = list(raw_jobs_by_id.values())
+          print("RAW_JOBS_MERGED_UNIQUE:", len(raw_jobs))
 
           # ---------- Step 3: deterministic post-filter — Ahmed's explicit rules only, no scoring ----------
+          #
+          # PASS = service_match AND niche_match (portfolio-business similarity)
+          #        AND exclusions_ok AND budget_ok AND valid_timestamp
+          #        AND age<=60min AND posted_at>=resume_timestamp
+          #        AND claimed (dedup, applied after this block, before send)
+          #
+          # JOB_ID_FIELD is defined earlier, in the constants section above
+          # Step 0 — it's needed by Step 2's merge-by-id loop, which runs
+          # before this comment block.
 
           EXCLUDE_KEYWORDS = [
               "react", "next.js", "nextjs", "laravel",
               "plugin development", "custom php backend",
               "full-stack", "full stack", "fullstack",
           ]
+
+          # Must indicate WordPress/Elementor/WooCommerce specifically — a
+          # bare "landing page" was removed because it doesn't say anything
+          # about the tech stack (could be built on anything).
+          SERVICE_KEYWORDS = [
+              "wordpress", "elementor", "elementor pro", "woocommerce",
+              "wordpress redesign", "wordpress website", "elementor website",
+              "responsive wordpress",
+          ]
+
+          # Portfolio-business-similarity groups. The bar for each group is
+          # not "same broad industry" — it's "would this client immediately
+          # recognize one of Ahmed's 3 portfolio pieces as similar to their
+          # own business." Every term here is a business-context phrase on
+          # purpose: bare single words that could false-match an unrelated
+          # trade or a software/technical sense of the word (e.g. bare
+          # "architect", "housekeeping", "jewelry", generic "online store"/
+          # "ecommerce"/"DTC"/"boutique") were deliberately left out.
+          NICHE_GROUPS = {
+              "Residential & home cleaning services": [
+                  "cleaning service", "cleaning company", "house cleaning",
+                  "home cleaning", "residential cleaning", "maid service",
+                  "maid company", "housekeeping service",
+                  "housekeeping company", "deep cleaning",
+                  "move-in cleaning", "move-out cleaning",
+                  "recurring cleaning",
+              ],
+              "Architecture & interior design studios": [
+                  "architecture studio", "architecture firm",
+                  "architectural firm", "architectural studio",
+                  "interior design", "interior designer",
+                  "interior design studio", "interior design firm",
+                  "residential architecture", "commercial interior design",
+                  "landscape architecture",
+              ],
+              "Fashion & clothing e-commerce brands": [
+                  "fashion brand", "fashion label", "fashion boutique",
+                  "fashion store", "fashion website", "fashion ecommerce",
+                  "fashion e-commerce", "clothing brand", "clothing line",
+                  "clothing store", "clothing boutique", "clothing ecommerce",
+                  "clothing e-commerce", "apparel brand", "apparel store",
+                  "apparel ecommerce", "streetwear", "streetwear brand",
+                  "footwear brand", "shoe brand", "shoes brand",
+                  "handbag brand", "bag brand", "fashion accessories brand",
+              ],
+          }
+
+          def normalize_text(text):
+              return " ".join((text or "").lower().split())
+
+          def job_text(job):
+              # Coerce defensively: this runs on every job before anything
+              # else, so an unexpected type here (skills as a bare string
+              # or an int, a non-string title) would raise TypeError and
+              # abort the entire filter step, losing every job's alert for
+              # the run — same failure class as the timestamp guard above.
+              skills = job.get("skills") or []
+              if not isinstance(skills, list):
+                  skills = [skills]
+              return normalize_text(" ".join([
+                  str(job.get("title") or ""),
+                  " ".join(str(s) for s in skills),
+                  str(job.get("description_snippet") or "")
+                  .replace("<untrusted_participant_content>", "")
+                  .replace("</untrusted_participant_content>", ""),
+              ]))
+
+          def keyword_matches(text, keyword):
+              kw = keyword.lower().strip()
+              if " " in kw:
+                  # Multi-word phrase — substring match is specific enough on
+                  # its own to avoid false positives.
+                  return kw in text
+              # Single token (hyphenated terms like "full-stack" included) —
+              # word-boundary match so e.g. "react" doesn't fire inside
+              # "reaction"/"reactive", "DTC" doesn't fire inside an unrelated
+              # longer acronym, etc.
+              return re.search(r"\b" + re.escape(kw) + r"\b", text) is not None
+
+          def any_keyword_matches(text, keywords):
+              return any(keyword_matches(text, kw) for kw in keywords)
+
+          def matched_niches(text):
+              return [name for name, kws in NICHE_GROUPS.items() if any_keyword_matches(text, kws)]
 
           def parse_budget_fixed(budget_str):
               try:
@@ -478,66 +853,147 @@ jobs:
               except (ValueError, TypeError):
                   return None
 
-          def contains_excluded_keyword(job):
-              text = " ".join([
-                  job.get("title", "") or "",
-                  " ".join(job.get("skills") or []),
-                  (job.get("description_snippet", "") or "")
-                  .replace("<untrusted_participant_content>", "")
-                  .replace("</untrusted_participant_content>", ""),
-              ]).lower()
-              for kw in EXCLUDE_KEYWORDS:
-                  if kw in text:
-                      return kw
-              return None
-
-          def posted_within_24h(job):
-              ts = job.get("published_date") or job.get("created_date")
-              if not ts:
-                  return True
-              try:
-                  posted = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                  now = datetime.datetime.now(datetime.timezone.utc)
-                  return (now - posted) <= datetime.timedelta(hours=24)
-              except ValueError:
-                  return True
-
-          def passes_filters(job):
+          def budget_ok(job):
               job_type = job.get("job_type")
               budget = job.get("budget")
               if job_type == "hourly":
                   min_rate = parse_hourly_min(budget)
-                  if min_rate is None or min_rate < 12:
-                      return False
-              elif job_type == "fixed":
+                  return min_rate is not None and min_rate >= 12
+              if job_type == "fixed":
                   fixed_amt = parse_budget_fixed(budget)
-                  if fixed_amt is None or fixed_amt < 250:
-                      return False
-              if contains_excluded_keyword(job):
-                  return False
-              if not posted_within_24h(job):
-                  return False
-              return True
+                  return fixed_amt is not None and fixed_amt >= 250
+              return False
 
-          kept = [job for job in raw_jobs if passes_filters(job)]
+          def parse_job_timestamp(job):
+              ts = job.get("published_date") or job.get("created_date")
+              # Reject a missing OR non-string timestamp outright. Without
+              # the isinstance check a non-string value (an epoch int, a
+              # nested object) raises AttributeError from .replace(), which
+              # the ValueError-only handler would not catch — that escapes
+              # evaluate_job and kills the whole run mid-filter, costing
+              # every other good job in the same run its alert. Rejecting
+              # is also the correct outcome: an unparseable timestamp can't
+              # satisfy the freshness or no-backfill rules.
+              if not isinstance(ts, str) or not ts:
+                  return None
+              try:
+                  parsed = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+                  return parsed
+              except (ValueError, TypeError):
+                  return None
+
+          def evaluate_job(job, now_utc):
+              # Returns the list of matched niche names on PASS, or None on
+              # any failed condition. Order follows Ahmed's approved pipeline
+              # exactly: service match -> portfolio-similarity niche match ->
+              # hard exclusions -> budget -> valid timestamp -> freshness ->
+              # no-backfill. Being a pure AND of independent conditions, the
+              # order doesn't change the PASS/FAIL result -- it's kept in
+              # this sequence for auditability against the approved design.
+              text = job_text(job)
+              if not any_keyword_matches(text, SERVICE_KEYWORDS):
+                  return None
+              niches = matched_niches(text)
+              if not niches:
+                  return None  # no portfolio-similarity match -> reject, never invent a score
+              if any_keyword_matches(text, EXCLUDE_KEYWORDS):
+                  return None
+              if not budget_ok(job):
+                  return None
+              posted_at = parse_job_timestamp(job)
+              if posted_at is None:
+                  return None  # reject missing/unparseable timestamp, no fallback pass
+              age = now_utc - posted_at
+              if age < datetime.timedelta(0) or age > datetime.timedelta(minutes=60):
+                  return None  # freshness window; also rejects future-dated (bad data)
+              if posted_at < resume_ts:
+                  return None  # no-backfill: nothing posted before the last /resume
+              return niches
+
+          now_utc = datetime.datetime.now(datetime.timezone.utc)
+          candidates = []
+          for job in raw_jobs:
+              niches = evaluate_job(job, now_utc)
+              if niches is not None:
+                  candidates.append((job, niches))
 
           print("JOBS_CHECKED:", len(raw_jobs))
-          print("JOBS_PASSED_FILTER:", len(kept))
+          print("JOBS_PASSED_FILTER:", len(candidates))
+
+          # Dedup: claim before send, batched in one call. Fail-closed on
+          # error (claim_job_ids returns an empty set), meaning a Worker/
+          # network problem here means zero sends this run rather than an
+          # unknown duplicate risk.
+          #
+          # The Worker's /dedup/claim requires every id to be a JSON string
+          # (typeof id === "string") -- str() here guards against Upwork's
+          # native "id" field turning out to be numeric on the wire, which
+          # would otherwise make the Worker reject the whole batch as
+          # invalid_ids and silently claim/send nothing, every run, with no
+          # obvious symptom beyond "no alerts ever arrive."
+          candidate_ids = [str(job.get(JOB_ID_FIELD)) for job, _ in candidates]
+          claimed_ids = claim_job_ids(candidate_ids)
+
+          if claimed_ids is None:
+              # The dedup layer failed outright. We hold candidates we
+              # cannot safely claim, so we send nothing (sending unclaimed
+              # would risk re-alerting the same job on a later run) and
+              # fail the run. Exiting green here would be the dangerous
+              # outcome: it would look identical to a quiet run while real
+              # matches were being dropped. In the normal failure modes
+              # (network, auth, non-200, untrusted body) nothing was
+              # written to KV, so these jobs stay eligible on a later run
+              # while they're still inside the 60-minute window.
+              print("DEDUP_CLAIM_FAILED — zero Telegram alerts sent this run (fail-closed); see the DEDUP_CLAIM_* line above for the reason.")
+              raise SystemExit(1)
+
+          candidates = [
+              (job, niches) for job, niches in candidates
+              if str(job.get(JOB_ID_FIELD)) in claimed_ids
+          ]
+
+          # An empty claimed set here is the normal "everything already
+          # seen" case — nothing to send, run stays green.
+          print("JOBS_CLAIMED_NEW:", len(candidates))
 
           # ---------- Step 4: private delivery to Telegram only — one message per job ----------
+          # Uses the retrying sender (send_telegram_with_retry) since a claim
+          # has already happened for every candidate here — a short retry on
+          # a transient Telegram blip is pure upside (shrinks the "claimed
+          # but never sent" lost-alert window) with no duplicate risk.
+          #
+          # Zero newly-claimed candidates sends NOTHING to Telegram — no
+          # "0 jobs this run" message. That message would be misleading in
+          # exactly the cases where it'd most often fire: a matching job
+          # that was already deduplicated, a dedup-infrastructure failure
+          # (which fails closed to "claim nothing"), or genuinely no fresh
+          # matches. Telegram is reserved for real job alerts plus the
+          # /pause, /resume, /status command replies — run-level status
+          # (counts, query success/failure) stays in GitHub Actions logs
+          # only.
 
           sent_ok = 0
           sent_fail = 0
-          for job in kept:
-              ok = send_telegram(build_job_message(job))
+          for job, niches in candidates:
+              # Build inside the loop's own guard: every job here has
+              # ALREADY been claimed in KV, so an exception escaping this
+              # loop would permanently lose the alerts for every remaining
+              # job too (they stay claimed for 48h and are never retried).
+              # One malformed job costs one alert, never the rest.
+              try:
+                  message = build_job_message(job, niches)
+              except Exception as e:
+                  print("MESSAGE_BUILD_FAILED:", type(e).__name__)
+                  sent_fail += 1
+                  continue
+              ok = send_telegram_with_retry(message)
               if ok:
                   sent_ok += 1
               else:
                   sent_fail += 1
               time.sleep(0.5)
-
-          if not kept:
-              send_telegram("Upwork search: 0 jobs passed your filters this run.")
 
           print("TELEGRAM_MESSAGES_SENT:", sent_ok)
           print("TELEGRAM_MESSAGES_FAILED:", sent_fail)
