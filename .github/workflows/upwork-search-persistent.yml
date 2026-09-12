@@ -444,6 +444,16 @@ jobs:
 
           raw_jobs = parsed.get("jobs", [])
 
+          # TEMPORARY DIAGNOSTIC -- one manual run only, to identify the
+          # stable unique job-ID field before wiring up dedup. Prints only
+          # dict KEY NAMES from the first job, never any values (no title,
+          # client info, budget, or description). Remove immediately once
+          # the field is confirmed.
+          if raw_jobs:
+              print("JOB_FIELD_NAMES_SAMPLE:", sorted(raw_jobs[0].keys()))
+          else:
+              print("NO_JOBS_RETURNED_THIS_RUN")
+
           # ---------- Step 3: deterministic post-filter — Ahmed's explicit rules only, no scoring ----------
 
           EXCLUDE_KEYWORDS = [
